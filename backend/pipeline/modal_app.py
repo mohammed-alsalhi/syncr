@@ -32,13 +32,19 @@ gpu_image = (
     .pip_install(
         "torch==2.2.0",
         "torchaudio==2.2.0",
+        "huggingface_hub<1.0",
         "pyannote.audio",
+        "demucs",
         "openai",
         "aiohttp",
         "aiofiles",
         "python-dotenv",
         "pydub",
-        "numpy",
+        "numpy<2",
+    )
+    .run_commands(
+        "find /usr/local/lib/python3.11/site-packages/nvidia -type d -name lib "
+        "> /etc/ld.so.conf.d/nvidia.conf && ldconfig"
     )
     .add_local_python_source("pipeline")
 )
@@ -52,6 +58,12 @@ whisper_image = (
         "faster-whisper",
         "pydub",
         "ctranslate2",
+        "nvidia-cublas-cu12",
+        "nvidia-cudnn-cu12",
+    )
+    .run_commands(
+        "find /usr/local/lib/python3.11/site-packages/nvidia -type d -name lib "
+        "> /etc/ld.so.conf.d/nvidia.conf && ldconfig"
     )
     .add_local_python_source("pipeline")
 )

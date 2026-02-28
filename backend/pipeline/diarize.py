@@ -24,16 +24,19 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
         [{"speaker": "SPEAKER_00", "start": 0.5, "end": 3.2,
           "audio_path": "...", "embedding": [0.1, 0.2, ...]}]
     """
+    # Set HF tokens BEFORE importing any huggingface/pyannote modules.
+    # Some huggingface_hub versions read the token at import time.
+    # Set both env var names for compatibility across library versions.
+    hf_token = os.environ["HF_TOKEN"]
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
     import torch
     import numpy as np
     from pyannote.audio import Pipeline, Inference
     from pydub import AudioSegment
-
-    hf_token = os.environ["HF_TOKEN"]
-
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        token=hf_token,
+        use_auth_token=hf_token,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -80,8 +83,8 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
     try:
         embedding_model = Inference(
             "pyannote/wespeaker-voxceleb-resnet34-LM",
-            token=hf_token,
             window="whole",
+            use_auth_token=hf_token,
         )
         embedding_model.to(device)
 
