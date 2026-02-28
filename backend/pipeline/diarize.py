@@ -29,13 +29,19 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
 
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
+        token=hf_token,
     )
 
     if torch.cuda.is_available():
         pipeline.to(torch.device("cuda"))
 
-    diarization = pipeline(audio_path)
+    output = pipeline(audio_path)
+
+    # pyannote 4.x returns DiarizeOutput; extract the Annotation object
+    if hasattr(output, "speaker_diarization"):
+        diarization = output.speaker_diarization
+    else:
+        diarization = output
 
     full_audio = AudioSegment.from_wav(audio_path)
 
