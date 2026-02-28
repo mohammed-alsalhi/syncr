@@ -2,35 +2,49 @@
 
 ## 1. System Overview
 
-Syncr is a video dubbing pipeline that takes an input video and produces a dubbed version where every speaker's voice is cloned and speaks the target language. The entire compute-heavy pipeline runs on Modal (serverless GPU cloud). A local FastAPI server handles uploads, job tracking, and serves results.
+Syncr is a movie-scale AI dubbing pipeline. Upload a video of any length — from a 30-second clip to a full-length film — and every actor speaks the target language in their own cloned voice with lip-sync-aware pacing. The pipeline runs on Modal (serverless GPU cloud) using a 3-level container hierarchy that scales to 40–60+ containers for feature-length content.
 
 ```
-┌──────────┐       POST /dub       ┌─────────────┐     .remote()     ┌──────────────────────────────┐
-│ Frontend │ ───────────────────→  │ FastAPI      │ ────────────────→ │ Modal Cloud                  │
-│ (React)  │ ←── GET /status ────  │ (local)      │ ←── return ─────  │                              │
-│          │ ←── GET /download ──  │              │                   │ ┌────────────────────────┐   │
-└──────────┘                       └─────────────┘                   │ │ Orchestrator container │   │
-                                                                     │ │ (GPU — T4)             │   │
-                                                                     │ │ extract → diarize →    │   │
-                                                                     │ │ transcribe → translate  │   │
-                                                                     │ └──────────┬─────────────┘   │
-                                                                     │            │ .spawn() per     │
-                                                                     │            │ speaker          │
-                                                                     │  ┌─────────▼──────────┐      │
-                                                                     │  │ Synth containers   │      │
-                                                                     │  │ (CPU, 1 per speaker)│      │
-                                                                     │  │ clone + synthesize  │      │
-                                                                     │  └─────────┬──────────┘      │
-                                                                     │            │                  │
-                                                                     │  ┌─────────▼──────────┐      │
-                                                                     │  │ Composite (CPU)    │      │
-                                                                     │  └────────────────────┘      │
-                                                                     └──────────────────────────────┘
+┌──────────┐       POST /dub       ┌─────────────┐     .remote()     ┌──────────────────────────────────────┐
+│ Frontend │ ───────────────────→  │ FastAPI      │ ────────────────→ │ Modal Cloud                          │
+│ (React)  │ ←── GET /status ────  │ (local)      │ ←── return ─────  │                                      │
+│ Pipeline │ polls every 1.5s      │              │                   │ ┌──────────────────────────────────┐ │
+│ Dashboard│                       └─────────────┘                   │ │ Coordinator (CPU)                │ │
+└──────────┘                                                         │ │ chunk → dispatch → match speakers│ │
+                                                                     │ │ → synthesize → quality → merge   │ │
+                                                                     │ └──────────┬───────────────────────┘ │
+                                                                     │            │ .spawn() per chunk       │
+                                                                     │  ┌─────────▼──────────────────────┐  │
+                                                                     │  │ process_chunk (GPU, N parallel) │  │
+                                                                     │  │ extract → diarize → transcribe  │  │
+                                                                     │  │ → translate (per chunk)         │  │
+                                                                     │  └─────────┬──────────────────────┘  │
+                                                                     │            │ .map() per segment       │
+                                                                     │  ┌─────────▼──────────────────────┐  │
+                                                                     │  │ WhisperTranscriber (GPU, T4)   │  │
+                                                                     │  │ Self-hosted faster-whisper      │  │
+                                                                     │  └────────────────────────────────┘  │
+                                                                     │                                      │
+                                                                     │  ┌────────────────────────────────┐  │
+                                                                     │  │ synthesize_speaker (CPU, 1/spk)│  │
+                                                                     │  │ ElevenLabs clone + TTS         │  │
+                                                                     │  └────────────────────────────────┘  │
+                                                                     └──────────────────────────────────────┘
 ```
 
-**Data flow:** Video file → FastAPI saves to disk → orchestrator calls Modal function → Modal runs pipeline (extract → diarize → transcribe → translate on one GPU container, then spawns parallel CPU containers for per-speaker voice synthesis) → composite → output video returned as bytes → FastAPI saves to disk and serves download.
+**Data flow:** Video file → FastAPI saves to disk → orchestrator calls `coordinator.remote()` in a background thread → coordinator chunks the video at scene boundaries → spawns `process_chunk` GPU containers in parallel (one per chunk) → each chunk runs extract → diarize → transcribe (self-hosted Whisper via `.map()`) → context-aware translate → coordinator matches speakers across chunks via embedding cosine similarity → spawns `synthesize_speaker` CPU containers (one per global speaker) → quality verification loop (re-translate + re-synthesize failed segments, max 2 retries) → merge all chunks into final video → return bytes → FastAPI saves to disk and serves download.
 
-**Why this architecture matters for judging:** The synthesis step spawns N containers simultaneously (one per speaker). For a clip with 3 speakers, judges see 3 containers fire in parallel on the Modal dashboard. This is genuinely load-bearing — synthesis is the slowest step and the parallelism produces a real speedup. The rest of the pipeline runs sequentially because each step depends on the previous one's output.
+**Container topology** (10-minute video, 2 chunks, 3 speakers, 20 segments):
+
+| Container | Count | Type | Purpose |
+|---|---|---|---|
+| coordinator | 1 | CPU | Chunk + dispatch + merge |
+| process_chunk | 2 | T4 GPU | Per-chunk pipeline |
+| WhisperTranscriber | up to 4 | T4 GPU | Parallel segment transcription |
+| synthesize_speaker | 3 | CPU | Per-speaker voice synthesis |
+| **Total** | **~10** | **3–5 GPU + 4–5 CPU** | |
+
+For a full movie (20 chunks, 5 speakers, 200 segments): **40–60+ containers**.
 
 ---
 
@@ -44,34 +58,45 @@ from typing import Optional
 
 class JobStatus(BaseModel):
     job_id: str
-    status: str           # "queued" | "running" | "done" | "error"
-    step: str             # human-readable current step
-    progress: int         # 0-100
+    status: str                             # queued | running | done | error
+    step: str                               # human-readable current step
+    progress: int                           # 0-100
     error: Optional[str] = None
     output_url: Optional[str] = None
+    # Chunk tracking
+    total_chunks: Optional[int] = None
+    completed_chunks: Optional[int] = None
+    # Pipeline metrics
+    speakers_found: Optional[int] = None
+    segments_found: Optional[int] = None
+    containers_active: Optional[int] = None
+    containers_total: Optional[int] = None
+    # Live transcript preview
+    transcript_preview: Optional[list[dict]] = None
+    # Per-step timing data
+    step_timings: Optional[dict] = None
 
-class SpeakerSegment(BaseModel):
-    """A single continuous speech segment from one speaker."""
-    speaker: str          # "SPEAKER_00", "SPEAKER_01", etc.
-    start: float          # start time in seconds
-    end: float            # end time in seconds
-    audio_path: str       # path to extracted audio clip for this segment
-
-class TranscribedSegment(SpeakerSegment):
-    text: str             # transcribed text (original language)
-
-class TranslatedSegment(TranscribedSegment):
-    translated_text: str  # translated text (target language)
-
-class SynthesizedSegment(BaseModel):
-    """A segment with dubbed audio ready for compositing."""
-    speaker: str
-    start: float
-    end: float
-    dubbed_audio_path: str  # path to synthesized audio clip
+class DubRequest(BaseModel):
+    target_language: str = "es"
 ```
 
-> **Implementation note:** The orchestrator currently passes dicts between steps. These models define the contract. Each pipeline function should accept and return lists of these dicts (matching the model fields). Pydantic validation is optional during hackathon — the models serve as documentation of the shape.
+**Segment dict shape** (used throughout the pipeline):
+```python
+{
+    "speaker": "SPEAKER_00",        # local label (per-chunk) or global (post-matching)
+    "start": 0.5,                   # seconds (chunk-relative in process_chunk, absolute after coordinator)
+    "end": 3.2,
+    "audio_path": "/tmp/seg.wav",   # local to container (not cross-container)
+    "text": "Hello, how are you?",  # original transcription
+    "translated_text": "Hola, ¿cómo estás?",
+    "audio_bytes": b"...",          # raw audio for cross-container transfer
+    "embedding": [0.1, 0.2, ...],   # speaker embedding for cross-chunk matching
+    "dubbed_audio_path": "/tmp/dub.mp3",  # after synthesis
+    "dubbed_audio_bytes": b"...",   # cross-container synthesis result
+}
+```
+
+Not all keys are present at every stage. Keys are added progressively as data flows through the pipeline.
 
 ---
 
@@ -81,10 +106,10 @@ class SynthesizedSegment(BaseModel):
 
 Upload a video and start a dubbing job.
 
-| Field             | Type       | Location  | Required | Default |
-|-------------------|------------|-----------|----------|---------|
-| `file`            | video file | form-data | yes      | —       |
-| `target_language` | string     | form-data | no       | `"es"`  |
+| Field | Type | Location | Required | Default |
+|---|---|---|---|---|
+| `file` | video file | form-data | yes | — |
+| `target_language` | string | form-data | no | `"es"` |
 
 **Response** `200`:
 ```json
@@ -95,17 +120,27 @@ Upload a video and start a dubbing job.
 
 ### `GET /status/{job_id}`
 
-Poll job progress.
+Poll job progress. Returns rich pipeline state for the frontend dashboard.
 
 **Response** `200`:
 ```json
 {
   "job_id": "550e8400-...",
   "status": "running",
-  "step": "Cloning voices and synthesizing speech...",
-  "progress": 60,
+  "step": "Diarizing speakers (chunk 2/4)...",
+  "progress": 35,
   "error": null,
-  "output_url": null
+  "output_url": null,
+  "total_chunks": 4,
+  "completed_chunks": 1,
+  "speakers_found": 3,
+  "segments_found": 20,
+  "containers_active": 3,
+  "containers_total": 10,
+  "transcript_preview": [
+    {"speaker": "SPEAKER_00", "start": 0.5, "text": "Hello", "translated_text": "Hola"}
+  ],
+  "step_timings": {"diarize": 12.3, "transcribe": 8.1}
 }
 ```
 
@@ -115,1020 +150,363 @@ Poll job progress.
 
 Returns the dubbed MP4 file. Only available when `status === "done"`.
 
-**Response** `200`: `video/mp4` file
-**Response** `200`: `{"error": "Output not ready"}` if not done
-
 ---
 
 ## 4. Modal Setup
 
 ### App and Image Definitions
 
-All Modal functions share one `modal.App`. Define two images — one for GPU work (diarization), one for CPU work (everything else).
+Three image tiers, all with `.add_local_python_source("pipeline")` for module access in remote containers:
 
 ```python
 # pipeline/modal_app.py
-
 import modal
 
 app = modal.App("syncr")
 
-# CPU image — lightweight, used by most steps
 cpu_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
-    .pip_install(
-        "openai",
-        "aiohttp",
-        "aiofiles",
-        "python-dotenv",
-        "pydub",
-    )
+    .pip_install("openai", "aiohttp", "aiofiles", "python-dotenv", "pydub")
+    .add_local_python_source("pipeline")
 )
 
-# GPU image — heavy, only used by diarization
 gpu_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
     .pip_install(
-        "torch",
-        "torchaudio",
-        "pyannote.audio",
+        "torch==2.2.0", "torchaudio==2.2.0", "pyannote.audio",
+        "openai", "aiohttp", "aiofiles", "python-dotenv", "pydub", "numpy",
     )
+    .add_local_python_source("pipeline")
+)
+
+whisper_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install("faster-whisper", "pydub", "ctranslate2")
+    .add_local_python_source("pipeline")
 )
 ```
+
+**Why `.add_local_python_source("pipeline")`:** Every remote container needs access to the pipeline modules (`extract.py`, `diarize.py`, etc.). Without this, `from pipeline.xxx import ...` fails with `ModuleNotFoundError`.
+
+**Why pinned torch versions:** Unpinned `torch` on GPU images may install CPU-only builds. `torch==2.2.0` guarantees CUDA support.
+
+**Why `ctranslate2`:** `faster-whisper` depends on it for GPU inference. Explicitly installing it ensures the CUDA runtime is bundled.
 
 ### Secrets
 
-All Modal functions that call external APIs need the `mimic-secrets` secret:
-
 ```python
 @app.function(
     image=cpu_image,
     secrets=[modal.Secret.from_name("mimic-secrets")],
-    timeout=300,
-    concurrency_limit=3,
 )
 ```
 
-### Volume for File Transfer
+Create via: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=... ELEVENLABS_API_KEY=...`
 
-Modal containers don't share a filesystem with your local machine. Use a `modal.Volume` to pass files between steps and back to the local server.
+### Progress Tracking via `modal.Dict`
 
-```python
-vol = modal.Volume.from_name("syncr-workspace", create_if_missing=True)
-
-@app.function(
-    image=cpu_image,
-    volumes={"/workspace": vol},
-    timeout=300,
-)
-def extract_audio(input_path: str, job_id: str) -> str:
-    # input_path is relative to /workspace
-    # writes output to /workspace/tmp/audio/{job_id}.wav
-    ...
-```
-
-**File transfer flow:**
-1. FastAPI saves uploaded video to local disk
-2. Before calling Modal, upload the file to the volume (or use `modal.Volume.put_file()`)
-3. Each Modal function reads/writes inside `/workspace/`
-4. After pipeline completes, download the output from the volume back to local disk
-
-**Architecture: hybrid approach (recommended).** One orchestrator function runs on a GPU container and handles the sequential steps (extract, diarize, transcribe, translate). It then spawns separate CPU containers for voice synthesis — one per speaker, running in parallel. Finally, composite runs in the orchestrator container.
-
-This gives you the best of both worlds: simple sequential flow where needed, visible parallelism for the Modal track judges, and a real speedup on the slowest step.
+All containers write real-time progress to a shared `modal.Dict`:
 
 ```python
-# pipeline/modal_jobs.py — see Section 6 for full implementation
-@app.function(image=gpu_image, gpu="T4", ...)
-def run_pipeline_remote(video_bytes: bytes, target_language: str) -> bytes:
-    # sequential: extract → diarize → transcribe → translate
-    # parallel:   spawn synthesize_speaker.spawn() per speaker
-    # sequential: composite
-    ...
-
-@app.function(image=cpu_image, ...)
-def synthesize_speaker(speaker: str, segments: list[dict], sample_bytes: bytes, ...) -> list[dict]:
-    # clone voice + synthesize all segments for one speaker
-    ...
-```
-
----
-
-## 5. Pipeline Functions — Full Specifications
-
-### 5.1 `extract_audio`
-
-**Purpose:** Extract the audio track from the input video as a WAV file.
-
-```python
-def extract_audio(input_video_path: str, job_id: str, work_dir: str = "/tmp") -> str:
-    """
-    Extract audio from video using ffmpeg.
-
-    Args:
-        input_video_path: Absolute path to input video file (mp4, mov, avi)
-        job_id:           Unique job identifier (used for output filename)
-        work_dir:         Directory to write output files
-
-    Returns:
-        Absolute path to extracted audio file (WAV, 16kHz mono)
-
-    Raises:
-        subprocess.CalledProcessError: If ffmpeg fails (corrupt video, unsupported codec)
-    """
-```
-
-**Implementation:**
-```python
-import subprocess
-import os
-
-def extract_audio(input_video_path: str, job_id: str, work_dir: str = "/tmp") -> str:
-    output_path = os.path.join(work_dir, f"{job_id}_audio.wav")
-
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", input_video_path,
-        "-vn",                    # no video
-        "-acodec", "pcm_s16le",   # 16-bit PCM
-        "-ar", "16000",           # 16kHz (required by Whisper and pyannote)
-        "-ac", "1",               # mono
-        output_path,
-    ], check=True, capture_output=True)
-
-    return output_path
-```
-
-**Output format:** WAV, 16kHz, mono, 16-bit PCM. This format is required by both pyannote (diarization) and Whisper (transcription).
-
-**Edge cases:**
-- Video with no audio track → ffmpeg returns error, raise exception
-- Very large video → ffmpeg streams, no memory issue, but may be slow
-
----
-
-### 5.2 `diarize_speakers`
-
-**Purpose:** Identify who speaks when. Split the full audio into per-speaker, per-segment audio clips.
-
-```python
-def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
-    """
-    Run speaker diarization on audio and split into per-segment clips.
-
-    Args:
-        audio_path: Path to WAV audio file (16kHz mono)
-        work_dir:   Directory to write segment audio files
-
-    Returns:
-        List of segment dicts, each containing:
-        {
-            "speaker": "SPEAKER_00",    # speaker label
-            "start": 0.5,               # start time in seconds
-            "end": 3.2,                 # end time in seconds
-            "audio_path": "/tmp/seg_0000_SPEAKER_00.wav"
-        }
-
-        Segments are sorted by start time.
-
-    Raises:
-        RuntimeError: If pyannote model fails to load (bad HF_TOKEN or no model access)
-    """
-```
-
-**Implementation:**
-```python
-import os
-import torch
-from pyannote.audio import Pipeline
-from pydub import AudioSegment
-
-def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
-    hf_token = os.environ["HF_TOKEN"]
-
-    # Load pyannote diarization pipeline
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
-    )
-
-    # Move to GPU if available
-    if torch.cuda.is_available():
-        pipeline.to(torch.device("cuda"))
-
-    # Run diarization
-    diarization = pipeline(audio_path)
-
-    # Load full audio for slicing
-    full_audio = AudioSegment.from_wav(audio_path)
-
-    segments = []
-    seg_dir = os.path.join(work_dir, "segments")
-    os.makedirs(seg_dir, exist_ok=True)
-
-    for i, (turn, _, speaker) in enumerate(diarization.itertracks(yield_label=True)):
-        start = turn.start
-        end = turn.end
-
-        # Skip very short segments (< 0.5s) — usually noise
-        if end - start < 0.5:
-            continue
-
-        # Extract audio clip for this segment
-        clip = full_audio[int(start * 1000):int(end * 1000)]
-        seg_path = os.path.join(seg_dir, f"seg_{i:04d}_{speaker}.wav")
-        clip.export(seg_path, format="wav")
-
-        segments.append({
-            "speaker": speaker,
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "audio_path": seg_path,
-        })
-
-    # Sort by start time
-    segments.sort(key=lambda s: s["start"])
-    return segments
-```
-
-**This is the only GPU-dependent step.** pyannote runs a neural network for voice activity detection and speaker embedding. On a T4 GPU, diarization of a 30-second clip takes ~10-30 seconds. Without GPU it may take 2-5x longer.
-
-**Tuning parameters:**
-- `min_duration_on` in pyannote controls minimum segment length. If segments are too fragmented, increase this.
-- The 0.5s minimum filter above prevents noise segments.
-
-**Model access prerequisite:** User must accept terms at:
-- https://huggingface.co/pyannote/speaker-diarization-3.1
-- https://huggingface.co/pyannote/segmentation-3.0
-
----
-
-### 5.3 `transcribe_segments`
-
-**Purpose:** Convert each audio segment's speech to text using OpenAI Whisper API.
-
-```python
-def transcribe_segments(segments: list[dict]) -> list[dict]:
-    """
-    Transcribe each segment's audio to text using Whisper.
-
-    Args:
-        segments: List of dicts with keys: speaker, start, end, audio_path
-
-    Returns:
-        Same list with added "text" field:
-        {
-            "speaker": "SPEAKER_00",
-            "start": 0.5,
-            "end": 3.2,
-            "audio_path": "/tmp/seg_0000_SPEAKER_00.wav",
-            "text": "Hello, how are you today?"
-        }
-
-    Raises:
-        openai.APIError: If Whisper API call fails
-    """
-```
-
-**Implementation:**
-```python
-import os
-from openai import OpenAI
-
-def transcribe_segments(segments: list[dict]) -> list[dict]:
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    result = []
-
-    for seg in segments:
-        with open(seg["audio_path"], "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text",
-            )
-
-        result.append({
-            **seg,
-            "text": transcript.strip(),
-        })
-
-    return result
-```
-
-**Cost:** Whisper API charges $0.006/minute of audio. A 30-second clip ≈ $0.003.
-
-**Edge cases:**
-- Silent segment → Whisper returns empty string. Keep the segment (it will produce empty translation, which is fine).
-- Non-English audio → Whisper auto-detects language. No `language` param needed for transcription.
-
-**Optimization (optional):** Batch segments from the same speaker into one longer audio file to reduce API call overhead. Not needed for hackathon.
-
----
-
-### 5.4 `translate_segments`
-
-**Purpose:** Translate each segment's text into the target language, with timing awareness.
-
-```python
-def translate_segments(segments: list[dict], target_language: str) -> list[dict]:
-    """
-    Translate transcribed text to target language.
-
-    Args:
-        segments:        List of dicts with keys: speaker, start, end, audio_path, text
-        target_language: ISO 639-1 language code (e.g., "es", "fr", "de")
-
-    Returns:
-        Same list with added "translated_text" field:
-        {
-            ...
-            "text": "Hello, how are you today?",
-            "translated_text": "Hola, ¿cómo estás hoy?"
-        }
-
-    Raises:
-        openai.APIError: If GPT API call fails
-    """
-```
-
-**Implementation:**
-```python
-import os
-from openai import OpenAI
-
-LANGUAGE_NAMES = {
-    "es": "Spanish", "fr": "French", "de": "German", "ar": "Arabic",
-    "zh": "Mandarin Chinese", "ja": "Japanese", "pt": "Portuguese",
-    "hi": "Hindi", "ko": "Korean", "it": "Italian",
+progress_dict = modal.Dict.from_name("syncr-progress", create_if_missing=True)
+progress_dict[job_id] = {
+    "status": "running",
+    "step": "Diarizing speakers (chunk 2/4)...",
+    "progress": 35,
+    "total_chunks": 4,
+    "completed_chunks": 1,
+    "containers_active": 3,
 }
-
-def translate_segments(segments: list[dict], target_language: str) -> list[dict]:
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    lang_name = LANGUAGE_NAMES.get(target_language, target_language)
-    result = []
-
-    for seg in segments:
-        if not seg["text"].strip():
-            result.append({**seg, "translated_text": ""})
-            continue
-
-        duration = seg["end"] - seg["start"]
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        f"You are a professional dubbing translator. "
-                        f"Translate the following dialogue line into {lang_name}. "
-                        f"The original line is spoken in {duration:.1f} seconds. "
-                        f"Your translation must be speakable in approximately the same duration. "
-                        f"Prefer shorter, natural phrasing over literal accuracy. "
-                        f"Return ONLY the translated text, nothing else."
-                    ),
-                },
-                {"role": "user", "content": seg["text"]},
-            ],
-            max_tokens=500,
-            temperature=0.3,
-        )
-
-        translated = response.choices[0].message.content.strip()
-        result.append({**seg, "translated_text": translated})
-
-    return result
 ```
 
-**Key design decision: timing-aware prompt.** The system prompt tells GPT the segment duration and asks for a translation that fits the same time window. This is the "lip-sync-aware pacing" from the concept doc. It's approximate but effective — shorter translations prevent dubbed audio from overrunning the original timing.
-
-**Why `gpt-4o-mini`:** 10x cheaper than `gpt-4o`, translation quality is comparable for common languages. Upgrade to `gpt-4o` only if translation quality is noticeably bad.
-
-**Batching optimization (optional):** Send all segments for one speaker in a single API call with numbered lines. Parse the numbered response. Reduces latency and cost for many short segments.
+The local orchestrator polls this Dict every 1 second and maps it to `JobStatus` fields.
 
 ---
 
-### 5.5 `synthesize_speakers`
+## 5. Pipeline Functions
 
-**Purpose:** Clone each speaker's voice using ElevenLabs, then synthesize dubbed audio for every segment in that voice.
+### 5.1 Scene-Aware Chunking (`chunk.py`)
+
+**Purpose:** Split long videos into ~5-minute chunks at scene boundaries for parallel processing.
 
 ```python
-async def synthesize_speakers(segments: list[dict], job_id: str, work_dir: str = "/tmp") -> list[dict]:
-    """
-    Clone voices and synthesize dubbed audio for all segments.
-    Processes speakers in parallel.
+def detect_scenes(video_path: str) -> list[dict]:
+    """Uses ffmpeg scene filter (gt(scene,0.3)) + showinfo. Returns scene boundaries."""
 
-    Args:
-        segments: List of dicts with keys: speaker, start, end, audio_path, text, translated_text
-        job_id:   Job identifier (used for voice clone naming)
-        work_dir: Directory to write synthesized audio files
-
-    Returns:
-        List of dicts with added "dubbed_audio_path" field:
-        {
-            "speaker": "SPEAKER_00",
-            "start": 0.5,
-            "end": 3.2,
-            "dubbed_audio_path": "/tmp/dubbed/dub_0000_SPEAKER_00.wav"
-        }
-
-    Raises:
-        aiohttp.ClientError: If ElevenLabs API call fails
-    """
+def split_video(video_path, scenes, max_chunk_duration=300.0, work_dir="/tmp") -> list[dict]:
+    """Groups scenes into chunks, applies 2s overlap, extracts via ffmpeg."""
 ```
 
-**Implementation:**
+**Scene detection:** Runs `ffmpeg -filter:v "select='gt(scene,0.3)',showinfo"` and parses `pts_time` values from stderr. If no scene changes detected, falls back to a single chunk.
+
+**Overlap:** Each chunk extends 2 seconds into its neighbors to preserve speaker continuity. Duplicate segments at boundaries are filtered out during merge.
+
+**Extraction:** Uses `-ss` before `-i` for fast seeking, then re-encodes with `libx264 -preset fast -crf 22` for frame-accurate boundaries (stream copy can drift on non-keyframe boundaries).
+
+### 5.2 Audio Extraction (`extract.py`)
+
 ```python
-import os
-import asyncio
-import aiohttp
-import aiofiles
-
-ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
-
-async def synthesize_speakers(segments: list[dict], job_id: str, work_dir: str = "/tmp") -> list[dict]:
-    api_key = os.environ["ELEVENLABS_API_KEY"]
-    dub_dir = os.path.join(work_dir, "dubbed")
-    os.makedirs(dub_dir, exist_ok=True)
-
-    # Group segments by speaker
-    speakers = {}
-    for seg in segments:
-        speakers.setdefault(seg["speaker"], []).append(seg)
-
-    # Find longest audio clip per speaker (best sample for cloning)
-    speaker_samples = {}
-    for spk, segs in speakers.items():
-        best = max(segs, key=lambda s: s["end"] - s["start"])
-        speaker_samples[spk] = best["audio_path"]
-
-    async with aiohttp.ClientSession() as session:
-        # Step A: Clone each speaker's voice (parallel)
-        voice_ids = {}
-        clone_tasks = [
-            _clone_voice(session, api_key, spk, sample_path, job_id)
-            for spk, sample_path in speaker_samples.items()
-        ]
-        clone_results = await asyncio.gather(*clone_tasks)
-        for spk, voice_id in clone_results:
-            voice_ids[spk] = voice_id
-
-        # Step B: Synthesize each segment (parallel, grouped by speaker)
-        synth_tasks = []
-        for i, seg in enumerate(segments):
-            if not seg.get("translated_text", "").strip():
-                continue
-            synth_tasks.append(
-                _synthesize_segment(session, api_key, seg, voice_ids[seg["speaker"]], i, dub_dir)
-            )
-        synth_results = await asyncio.gather(*synth_tasks)
-
-        # Step C: Clean up cloned voices (free tier has voice limit)
-        for voice_id in voice_ids.values():
-            await _delete_voice(session, api_key, voice_id)
-
-    return synth_results
-
-
-async def _clone_voice(
-    session: aiohttp.ClientSession,
-    api_key: str,
-    speaker: str,
-    sample_path: str,
-    job_id: str,
-) -> tuple[str, str]:
-    """
-    Clone a voice from an audio sample.
-
-    Returns:
-        Tuple of (speaker_label, voice_id)
-    """
-    url = f"{ELEVENLABS_BASE}/voices/add"
-    headers = {"xi-api-key": api_key}
-
-    async with aiofiles.open(sample_path, "rb") as f:
-        sample_bytes = await f.read()
-
-    form = aiohttp.FormData()
-    form.add_field("name", f"{job_id}_{speaker}")
-    form.add_field("files", sample_bytes, filename=f"{speaker}.wav", content_type="audio/wav")
-
-    async with session.post(url, headers=headers, data=form) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
-        return (speaker, data["voice_id"])
-
-
-async def _synthesize_segment(
-    session: aiohttp.ClientSession,
-    api_key: str,
-    segment: dict,
-    voice_id: str,
-    index: int,
-    output_dir: str,
-) -> dict:
-    """
-    Synthesize one segment of dubbed audio.
-
-    Returns:
-        Segment dict with dubbed_audio_path added.
-    """
-    url = f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": api_key,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg",
-    }
-    payload = {
-        "text": segment["translated_text"],
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
-    }
-
-    async with session.post(url, headers=headers, json=payload) as resp:
-        resp.raise_for_status()
-        audio_bytes = await resp.read()
-
-    output_path = os.path.join(output_dir, f"dub_{index:04d}_{segment['speaker']}.mp3")
-    async with aiofiles.open(output_path, "wb") as f:
-        await f.write(audio_bytes)
-
-    return {
-        "speaker": segment["speaker"],
-        "start": segment["start"],
-        "end": segment["end"],
-        "dubbed_audio_path": output_path,
-    }
-
-
-async def _delete_voice(session: aiohttp.ClientSession, api_key: str, voice_id: str):
-    """Delete a cloned voice to stay within free tier limits."""
-    url = f"{ELEVENLABS_BASE}/voices/{voice_id}"
-    headers = {"xi-api-key": api_key}
-    async with session.delete(url, headers=headers) as resp:
-        pass  # best-effort cleanup, don't fail the pipeline
+def extract_audio(input_video_path: str, job_id: str, work_dir: str = "/tmp") -> str:
+    """ffmpeg: extract audio as WAV, 16kHz mono, 16-bit PCM."""
 ```
 
-**Critical details:**
-- **Clone once per speaker, not per segment.** Group segments by speaker, clone voice once, reuse for all that speaker's segments.
-- **Use the longest audio clip as the clone sample.** Longer samples (>5 seconds) produce better voice clones.
-- **Delete voices after the job.** ElevenLabs free tier limits you to 3 custom voices. Cleanup prevents hitting the limit.
-- **`eleven_multilingual_v2`** is the model that supports non-English TTS. Do not use `eleven_monolingual_v1`.
-- **Output is MP3** (ElevenLabs default). ffmpeg can handle this in the composite step.
+Output format required by both pyannote (diarization) and Whisper (transcription).
 
-**Parallel execution:** `asyncio.gather` runs all clone operations in parallel, then all synthesis operations in parallel. This is the main speed optimization.
+### 5.3 Speaker Diarization (`diarize.py`)
+
+```python
+def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
+    """pyannote/speaker-diarization-3.1 on GPU. Returns segments with speaker embeddings."""
+```
+
+**Speaker embeddings:** After diarization, extracts a representative embedding per speaker using `pyannote/wespeaker-voxceleb-resnet34-LM` (from the longest segment per speaker). Embeddings are used by the coordinator for cross-chunk speaker matching.
+
+**Graceful degradation:** Embedding extraction is wrapped in try/except. If it fails, segments still work — just without cross-chunk speaker matching capability.
+
+### 5.4 Self-Hosted Whisper Transcription (`WhisperTranscriber` in `modal_jobs.py`)
+
+```python
+@app.cls(image=whisper_image, gpu="T4", concurrency_limit=4)
+class WhisperTranscriber:
+    @modal.enter()
+    def load_model(self):
+        self.model = WhisperModel("medium", device="cuda", compute_type="float16")
+
+    @modal.method()
+    def transcribe(self, audio_bytes: bytes) -> str:
+```
+
+**Key design:** Uses `@modal.enter()` to load the model once when the container starts, then reuses it across all `.transcribe()` calls. Called via `.map()` from `process_chunk` for parallel transcription across segments.
+
+**Why self-hosted instead of API:** Eliminates per-minute API costs, runs on our own GPU containers, gives us more control, and looks much more impressive for the Modal prize.
+
+### 5.5 Context-Aware Translation (`translate.py`)
+
+Two modes:
+- `translate_segments()` — sequential, per-segment (for local testing)
+- `translate_segments_with_context()` — groups 5 segments into batches with surrounding dialogue context
+
+```python
+def translate_segments_with_context(segments, target_language) -> list[dict]:
+    """GPT-4o-mini with dialogue context. Format: [SPEAKER, duration]: text"""
+```
+
+**Why context-aware:** Single-segment translation misses conversational flow. Batching nearby segments lets GPT understand who's responding to whom, producing dramatically better translations for dialogue.
+
+**Response parsing:** Expects `[SPEAKER]: translation` format. Parser only strips prefix if line starts with `[` (bracket format) or `SPEAKER` to avoid accidentally truncating translated text that contains colons.
+
+### 5.6 Voice Synthesis (`synthesize_speaker` in `modal_jobs.py`)
+
+```python
+@app.function(image=cpu_image, concurrency_limit=6, secrets=[...])
+def synthesize_speaker(speaker, segments, sample_bytes, job_id) -> list[dict]:
+    """Clone one voice via ElevenLabs, synthesize all segments, delete voice."""
+```
+
+**One container per global speaker.** After cross-chunk speaker matching, the coordinator spawns one synthesis container per unique speaker (not per chunk). Each container: clones the voice → synthesizes all segments → deletes the clone (free tier: 3 voice limit).
+
+**Bytes, not paths:** Containers have separate filesystems. Voice samples go in as `sample_bytes`, dubbed audio comes back as `dubbed_audio_bytes`.
+
+### 5.7 Quality Verification (`quality.py`)
+
+```python
+def verify_segments(segments) -> tuple[list[dict], list[dict]]:
+    """Returns (passed, failed) with failure_reason on failed segments."""
+
+def build_strict_retranslation_prompt(segment, target_language) -> str:
+    """Builds a stricter prompt asking for 80% duration translation."""
+```
+
+**Checks per segment:**
+- **Timing:** Dubbed audio > 1.5x the original time slot → `too_long`
+- **Overlap:** Dubbed audio (after speedup) would collide with next segment → `overlap`
+- **Silence:** dBFS < -35 → `mostly_silence`
+- **Minimum length:** < 0.3 seconds → `too_short`
+
+**Retry loop** (in coordinator): Failed segments → re-translate with stricter duration constraint → re-synthesize → verify again. Max 2 rounds, then accept with speedup (graceful degradation).
+
+### 5.8 Chunk Merging (`merge.py`)
+
+```python
+def merge_chunks(original_video, chunk_results, job_id, output_dir) -> str:
+    """Merge dubbed audio from all chunks onto original video."""
+```
+
+**Steps:** Filter overlap duplicates → build full-length silent AudioSegment → overlay each dubbed segment at absolute timestamp → apply atempo speedup if needed → mux with original video (video stream copied, audio replaced).
+
+### 5.9 Video Composition (`composite.py`)
+
+Provides `_build_atempo_chain()` for speedup and `composite_video()` for single-chunk compositing. Used by `merge.py` for the atempo chain.
 
 ---
 
-### 5.6 `composite_video`
+## 6. Container Orchestration
 
-**Purpose:** Replace the original audio track with the dubbed audio segments, producing the final video.
+### 3-Level Hierarchy (`modal_jobs.py`)
 
-```python
-def composite_video(
-    input_video: str,
-    synthesized_segments: list[dict],
-    job_id: str,
-    output_dir: str,
-) -> str:
-    """
-    Composite dubbed audio segments back onto the original video.
+**Level 1 — `coordinator` (CPU, timeout=900s):**
+1. Save input video to temp dir
+2. Call `detect_scenes()` + `split_video()` (fast, just ffmpeg)
+3. Spawn `process_chunk.spawn()` per chunk (parallel GPU containers)
+4. Collect results as they complete, update progress
+5. Match speakers across chunks via embedding cosine similarity
+6. Spawn `synthesize_speaker.spawn()` per global speaker (parallel CPU containers)
+7. Collect synthesis results
+8. Run quality verification + retry loop
+9. Call `merge_chunks()` for final video
+10. Return final video as bytes
 
-    Args:
-        input_video:           Path to original video file
-        synthesized_segments:  List of dicts with keys: speaker, start, end, dubbed_audio_path
-        job_id:                Job identifier (used for output filename)
-        output_dir:            Directory to write final video
+**Level 2 — `process_chunk` (GPU T4, timeout=600s):**
+1. Extract audio from chunk
+2. Diarize speakers (pyannote on GPU)
+3. Transcribe via `WhisperTranscriber.transcribe.map()` (parallel GPU)
+4. Translate with context (`translate_segments_with_context`)
+5. Return segments with text, translated_text, audio_bytes, embeddings
 
-    Returns:
-        Path to dubbed video file (MP4)
+**Level 2 — `WhisperTranscriber` (GPU T4, `@app.cls`):**
+- Model loaded once via `@modal.enter()`, reused across calls
+- Called via `.map()` for parallel segment transcription
+- `concurrency_limit=4` — up to 4 transcriber containers
 
-    Raises:
-        subprocess.CalledProcessError: If ffmpeg fails
-    """
-```
+**Level 3 — `synthesize_speaker` (CPU, concurrency_limit=6):**
+- One container per speaker
+- Clone voice → synthesize all segments → delete voice
+- Returns `dubbed_audio_bytes` per segment
 
-**Implementation:**
-```python
-import subprocess
-import os
-from pydub import AudioSegment
+### Cross-Chunk Speaker Matching
 
-def composite_video(
-    input_video: str,
-    synthesized_segments: list[dict],
-    job_id: str,
-    output_dir: str,
-) -> str:
-    os.makedirs(output_dir, exist_ok=True)
+After all chunks complete, the coordinator has speaker embeddings from every segment across all chunks. Speaker matching:
 
-    # Step 1: Get original video duration
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", input_video],
-        capture_output=True, text=True, check=True,
-    )
-    total_duration_ms = int(float(probe.stdout.strip()) * 1000)
+1. Collect one representative embedding per `(chunk_idx, local_speaker)` pair
+2. Greedy clustering: for each embedding, compute cosine similarity against existing clusters
+3. If similarity > 0.85, assign to that cluster (same person)
+4. Otherwise, create a new global speaker cluster
+5. Map all segments to global speaker IDs
 
-    # Step 2: Build a full-length silent audio track
-    mixed = AudioSegment.silent(duration=total_duration_ms)
+This ensures that "SPEAKER_00" in chunk 1 and "SPEAKER_01" in chunk 3 are recognized as the same person if their voice embeddings match.
 
-    # Step 3: Overlay each dubbed segment at its timestamp
-    for seg in synthesized_segments:
-        dubbed_clip = AudioSegment.from_file(seg["dubbed_audio_path"])
-        position_ms = int(seg["start"] * 1000)
-        target_duration_ms = int((seg["end"] - seg["start"]) * 1000)
+### Progress Tracking
 
-        # If dubbed audio is longer than the original slot, speed it up
-        if len(dubbed_clip) > target_duration_ms and target_duration_ms > 0:
-            speed_factor = len(dubbed_clip) / target_duration_ms
-            # Build atempo filter chain — each atempo filter maxes at 2.0,
-            # so chain them for higher ratios (e.g., 3x = atempo=2.0,atempo=1.5)
-            atempo_chain = _build_atempo_chain(speed_factor)
-            sped_up_path = seg["dubbed_audio_path"] + ".speed.wav"
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-i", seg["dubbed_audio_path"],
-                "-filter:a", atempo_chain,
-                sped_up_path,
-            ], check=True, capture_output=True)
-            dubbed_clip = AudioSegment.from_file(sped_up_path)
-
-        # Truncate if still too long
-        dubbed_clip = dubbed_clip[:target_duration_ms]
-
-        mixed = mixed.overlay(dubbed_clip, position=position_ms)
-
-    # Step 4: Export mixed audio
-    mixed_audio_path = os.path.join(output_dir, f"{job_id}_mixed.wav")
-    mixed.export(mixed_audio_path, format="wav")
-
-    # Step 5: Combine original video (no audio) with new audio
-    output_path = os.path.join(output_dir, f"{job_id}_dubbed.mp4")
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", input_video,
-        "-i", mixed_audio_path,
-        "-c:v", "copy",         # keep original video codec (fast, no re-encoding)
-        "-map", "0:v:0",        # video from first input
-        "-map", "1:a:0",        # audio from second input
-        "-shortest",
-        output_path,
-    ], check=True, capture_output=True)
-
-    return output_path
-```
-
-**`_build_atempo_chain` helper:**
-```python
-def _build_atempo_chain(speed_factor: float) -> str:
-    """
-    Build an ffmpeg atempo filter chain for arbitrary speedup.
-    Each atempo filter is capped at 2.0x, so we chain multiple
-    for higher ratios. E.g., 3.0x → "atempo=2.0,atempo=1.5"
-    Cap total speedup at 4.0x to avoid unintelligible audio.
-    """
-    speed_factor = min(speed_factor, 4.0)
-    filters = []
-    remaining = speed_factor
-    while remaining > 1.0:
-        chunk = min(remaining, 2.0)
-        filters.append(f"atempo={chunk:.4f}")
-        remaining /= chunk
-    return ",".join(filters) if filters else "atempo=1.0"
-```
-
-**Key decisions:**
-- **Silent base track:** Start with silence, overlay dubbed clips at their timestamps. Gaps between segments are naturally silent.
-- **Speed adjustment:** If the dubbed audio is longer than the original segment's time window, speed it up using chained `atempo` filters. Each `atempo` maxes at 2.0x, so we chain them (e.g., 3x = `atempo=2.0,atempo=1.5`). Total speedup is capped at 4.0x — beyond that, speech becomes unintelligible anyway. This matters for Arabic and German translations, which tend to be wordier than English.
-- **Video passthrough:** `-c:v copy` copies the video stream without re-encoding. This is fast and lossless.
-- **Output format:** MP4 with original video + new audio.
-
----
-
-## 6. Orchestrator — Modal Integration
-
-The orchestrator uses a hybrid approach: one GPU container runs the sequential steps, then spawns parallel CPU containers for per-speaker synthesis.
-
-### `pipeline/modal_jobs.py`
+All containers write to `modal.Dict.from_name("syncr-progress")`. The `_update_progress()` helper merges updates:
 
 ```python
-import modal
-from pipeline.modal_app import app, gpu_image, cpu_image
-
-# ── Per-speaker synthesis (spawned in parallel) ─────────────────────────────
-
-@app.function(
-    image=cpu_image,
-    timeout=300,
-    concurrency_limit=6,
-    secrets=[modal.Secret.from_name("mimic-secrets")],
+_update_progress(job_id,
+    step="Diarizing speakers (chunk 2/4)...",
+    progress=35,
+    completed_chunks=1,
+    containers_active=3,
 )
-def synthesize_speaker(
-    speaker: str,
-    segments: list[dict],
-    sample_bytes: bytes,
-    job_id: str,
-) -> list[dict]:
-    """
-    Clone one speaker's voice and synthesize all their segments.
-    Runs in its own container — one container per speaker, all in parallel.
-
-    Args:
-        speaker:      Speaker label ("SPEAKER_00")
-        segments:     All translated segments for this speaker
-        sample_bytes: Raw audio bytes of the best voice sample for cloning
-        job_id:       Job identifier for voice clone naming
-
-    Returns:
-        List of segment dicts with dubbed_audio_bytes added (bytes, not paths —
-        since each container has its own filesystem).
-    """
-    import asyncio
-    import os
-    import aiohttp
-    import tempfile
-
-    ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
-    api_key = os.environ["ELEVENLABS_API_KEY"]
-
-    async def _run():
-        async with aiohttp.ClientSession() as session:
-            # Clone voice
-            headers = {"xi-api-key": api_key}
-            form = aiohttp.FormData()
-            form.add_field("name", f"{job_id}_{speaker}")
-            form.add_field("files", sample_bytes, filename=f"{speaker}.wav", content_type="audio/wav")
-            async with session.post(f"{ELEVENLABS_BASE}/voices/add", headers=headers, data=form) as resp:
-                resp.raise_for_status()
-                voice_id = (await resp.json())["voice_id"]
-
-            # Synthesize all segments for this speaker
-            results = []
-            for seg in segments:
-                if not seg.get("translated_text", "").strip():
-                    continue
-
-                payload = {
-                    "text": seg["translated_text"],
-                    "model_id": "eleven_multilingual_v2",
-                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-                }
-                headers_tts = {
-                    "xi-api-key": api_key,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg",
-                }
-                async with session.post(
-                    f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}",
-                    headers=headers_tts, json=payload,
-                ) as resp:
-                    resp.raise_for_status()
-                    audio_bytes = await resp.read()
-
-                results.append({
-                    "speaker": seg["speaker"],
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "dubbed_audio_bytes": audio_bytes,
-                })
-
-            # Cleanup: delete cloned voice
-            async with session.delete(
-                f"{ELEVENLABS_BASE}/voices/{voice_id}", headers={"xi-api-key": api_key}
-            ) as resp:
-                pass  # best-effort
-
-            return results
-
-    return asyncio.run(_run())
-
-
-# ── Main orchestrator (GPU container) ────────────────────────────────────────
-
-@app.function(
-    image=gpu_image,
-    gpu="T4",
-    timeout=600,
-    concurrency_limit=2,
-    secrets=[modal.Secret.from_name("mimic-secrets")],
-)
-def run_pipeline_remote(video_bytes: bytes, target_language: str) -> bytes:
-    """
-    Main pipeline orchestrator. Runs on GPU for diarization.
-    Spawns parallel containers for synthesis.
-    """
-    import tempfile, os, asyncio
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Save input
-        input_path = os.path.join(tmpdir, "input.mp4")
-        with open(input_path, "wb") as f:
-            f.write(video_bytes)
-
-        # ── Sequential steps (all in this container) ──
-        from pipeline.extract import extract_audio
-        from pipeline.diarize import diarize_speakers
-        from pipeline.transcribe import transcribe_segments
-        from pipeline.translate import translate_segments
-        from pipeline.composite import composite_video
-
-        audio_path = extract_audio(input_path, "job", tmpdir)
-        segments = diarize_speakers(audio_path, tmpdir)
-        segments = transcribe_segments(segments)
-        segments = translate_segments(segments, target_language)
-
-        # ── Parallel synthesis (spawn one container per speaker) ──
-        speakers = {}
-        for seg in segments:
-            speakers.setdefault(seg["speaker"], []).append(seg)
-
-        # Read voice samples (longest clip per speaker)
-        speaker_samples = {}
-        for spk, segs in speakers.items():
-            best = max(segs, key=lambda s: s["end"] - s["start"])
-            with open(best["audio_path"], "rb") as f:
-                speaker_samples[spk] = f.read()
-
-        # Spawn parallel containers
-        handles = []
-        for spk, segs in speakers.items():
-            # Strip audio_path (not accessible from synth container)
-            clean_segs = [
-                {k: v for k, v in s.items() if k != "audio_path"} for s in segs
-            ]
-            handle = synthesize_speaker.spawn(spk, clean_segs, speaker_samples[spk], "job")
-            handles.append(handle)
-
-        # Collect results from all containers
-        synthesized = []
-        dub_dir = os.path.join(tmpdir, "dubbed")
-        os.makedirs(dub_dir, exist_ok=True)
-
-        for handle in handles:
-            speaker_results = handle.get()
-            for i, seg in enumerate(speaker_results):
-                # Write audio bytes to disk for compositing
-                dub_path = os.path.join(dub_dir, f"dub_{seg['speaker']}_{i:04d}.mp3")
-                with open(dub_path, "wb") as f:
-                    f.write(seg["dubbed_audio_bytes"])
-                synthesized.append({
-                    "speaker": seg["speaker"],
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "dubbed_audio_path": dub_path,
-                })
-
-        # ── Composite (back in this container) ──
-        output_path = composite_video(input_path, synthesized, "job", os.path.join(tmpdir, "output"))
-
-        with open(output_path, "rb") as f:
-            return f.read()
 ```
 
-**Key detail: `.spawn()` vs `.remote()`.** Using `synthesize_speaker.spawn()` returns a handle immediately without blocking. This launches all speaker containers simultaneously. Then `handle.get()` collects each result. For a 3-speaker clip, the Modal dashboard shows 1 GPU container + 3 CPU containers running at the same time.
+The local orchestrator (`orchestrator.py`) runs `_poll_modal_progress()` in a background thread that reads this Dict every 1 second and maps it to `JobStatus` fields.
 
-**Why bytes instead of paths:** Each spawned container has its own filesystem. The synth containers can't read files from the orchestrator container. So we pass `sample_bytes` in and return `dubbed_audio_bytes` out. The orchestrator writes them to disk for the composite step.
-
-### Updated `pipeline/orchestrator.py`
-
-The local orchestrator calls Modal and simulates progress on the client side.
-
-```python
-import asyncio
-import time
-import threading
-from pathlib import Path
-from models import JobStatus
-
-
-def update_job(jobs, job_id, status, step, progress, error=None):
-    jobs[job_id] = JobStatus(
-        job_id=job_id, status=status, step=step,
-        progress=progress, error=error,
-        output_url=f"/download/{job_id}" if status == "done" else None,
-    )
-
-
-# Simulated progress steps with estimated durations (seconds)
-PROGRESS_STEPS = [
-    ("Extracting audio...",              5,  10,  3),
-    ("Identifying speakers...",         10,  25, 15),
-    ("Transcribing speech...",          25,  40, 10),
-    ("Translating dialogue...",         40,  55,  8),
-    ("Cloning voices (parallel)...",    55,  75, 20),
-    ("Compositing final video...",      75,  90, 10),
-]
-
-
-def _simulate_progress(jobs, job_id, stop_event: threading.Event):
-    """
-    Advance the progress bar through estimated step timings.
-    Runs in a background thread. Stops when stop_event is set
-    (i.e., when the Modal call returns).
-    """
-    for step_name, start_pct, end_pct, duration_s in PROGRESS_STEPS:
-        if stop_event.is_set():
-            return
-        update_job(jobs, job_id, "running", step_name, start_pct)
-        # Interpolate progress within this step
-        intervals = max(duration_s, 1)
-        for tick in range(intervals):
-            if stop_event.is_set():
-                return
-            time.sleep(1)
-            pct = start_pct + int((end_pct - start_pct) * (tick + 1) / intervals)
-            update_job(jobs, job_id, "running", step_name, pct)
-
-
-async def run_pipeline(job_id, input_path, target_language, jobs, output_dir):
-    try:
-        update_job(jobs, job_id, "running", "Starting...", 2)
-
-        with open(input_path, "rb") as f:
-            video_bytes = f.read()
-
-        # Start simulated progress in background thread
-        stop_event = threading.Event()
-        progress_thread = threading.Thread(
-            target=_simulate_progress, args=(jobs, job_id, stop_event), daemon=True,
-        )
-        progress_thread.start()
-
-        # Call Modal — blocks until pipeline completes
-        from pipeline.modal_jobs import run_pipeline_remote
-        output_bytes = run_pipeline_remote.remote(video_bytes, target_language)
-
-        # Stop simulated progress
-        stop_event.set()
-        progress_thread.join(timeout=2)
-
-        # Save output locally
-        update_job(jobs, job_id, "running", "Saving output...", 95)
-        output_path = Path(output_dir) / f"{job_id}_dubbed.mp4"
-        with open(output_path, "wb") as f:
-            f.write(output_bytes)
-
-        update_job(jobs, job_id, "done", "Complete!", 100)
-
-    except Exception as e:
-        stop_event.set()
-        update_job(jobs, job_id, "error", "Pipeline failed", 0, error=str(e))
-        raise
-```
-
-**Progress simulation:** The Modal call is a single blocking `.remote()` call. While it blocks, a background thread walks through the expected pipeline steps with timed increments. The frontend sees the progress bar advance through "Extracting audio..." → "Identifying speakers..." → etc. When Modal returns, the thread stops and progress jumps to 100%. The step durations are estimates — if the actual pipeline is faster or slower, the progress bar will either jump forward or pause at the last reached step. This is cosmetic, not functional, but it makes the UI/UX prize demo significantly more compelling.
+The Dict reference is lazily initialized (not at module import time) to avoid crashing when Modal is not authenticated during local development.
 
 ---
 
-## 7. File Structure (Target)
+## 7. Local Orchestrator (`orchestrator.py`)
+
+```python
+def run_pipeline(job_id, input_path, target_language, jobs, output_dir):
+    """Sync function — FastAPI BackgroundTasks runs it in a threadpool."""
+```
+
+**Key design:** This is a regular (non-async) function. FastAPI's `BackgroundTasks.add_task()` runs sync functions in a threadpool, so the blocking `coordinator.remote()` call doesn't freeze the event loop. This means `/status` polling continues to work while the pipeline runs.
+
+**Flow:**
+1. Read video bytes from disk
+2. Start `_poll_modal_progress` thread (polls `modal.Dict` every 1s)
+3. Call `coordinator.remote(video_bytes, target_language, job_id)` — blocks until pipeline completes
+4. Stop progress polling thread
+5. Save output bytes to disk
+6. Update job status to `done`
+
+**Error handling:** `stop_event` is initialized before the try block so it's always available in the except handler.
+
+---
+
+## 8. Frontend (`App.jsx`)
+
+### Pipeline Dashboard
+
+The frontend replaces a simple progress bar with a rich pipeline visualization:
+
+**Pipeline nodes:** Horizontal row of step icons (Extract → Diarize → Transcribe → Translate → Synthesize → Quality → Composite) with per-step status derived from `status.step` keywords. Active steps pulse with a glow animation.
+
+**Metric pills:** Live counters — chunks completed, speakers identified, segments processed, containers active, quality checks passed.
+
+**Transcript panel:** Scrollable panel showing speaker-color-coded transcript building up as chunks complete. Each speaker gets a consistent color.
+
+### Synced Video Player
+
+Two `<video>` elements in a grid with shared controls:
+- Left: original video (muted by default)
+- Right: dubbed video (plays audio)
+- Shared play/pause button and scrubber
+- Drift correction: if videos desync by > 0.3s, the lagging video seeks to match
+
+### Animations (`index.css` + `tailwind.config.js`)
+
+Custom keyframes registered as Tailwind utilities:
+- `animate-fade-in` — elements entering view
+- `animate-slide-up` — dashboard components mounting
+- `animate-glow` — active pipeline step indicator
+- `animate-shake` — error state
+
+---
+
+## 9. File Structure
 
 ```
 syncr/
-├── CLAUDE.md
-├── CONCEPT.md
+├── CLAUDE.md                    # Source of truth for Claude sessions
 ├── README.md
-├── TECH_SPEC.md
-├── MODAL_NOTES.md
-├── SPENDING_LIMITS.md
 ├── backend/
-│   ├── .env                    # API keys (git-ignored)
-│   ├── .env.example            # template
+│   ├── .env                     # API keys (git-ignored)
+│   ├── .env.example
 │   ├── requirements.txt
-│   ├── main.py                 # FastAPI server
-│   ├── models.py               # Pydantic models (JobStatus, etc.)
+│   ├── main.py                  # FastAPI server (3 endpoints)
+│   ├── models.py                # Pydantic models (JobStatus with chunk tracking)
 │   └── pipeline/
-│       ├── __init__.py
-│       ├── modal_app.py        # Modal App, Image, Volume definitions
-│       ├── modal_jobs.py       # Modal function: run_pipeline_remote
-│       ├── orchestrator.py     # Local orchestrator (calls Modal)
-│       ├── extract.py          # ffmpeg audio extraction
-│       ├── diarize.py          # pyannote speaker diarization
-│       ├── transcribe.py       # Whisper transcription
-│       ├── translate.py        # GPT-4o-mini translation
-│       ├── synthesize.py       # ElevenLabs voice cloning + TTS
-│       └── composite.py        # ffmpeg video composition
+│       ├── modal_app.py         # Modal App + 3 image definitions
+│       ├── modal_jobs.py        # 3-level container hierarchy
+│       ├── orchestrator.py      # Local orchestrator (real progress via modal.Dict)
+│       ├── chunk.py             # Scene-aware video chunking
+│       ├── extract.py           # ffmpeg audio extraction
+│       ├── diarize.py           # pyannote diarization + speaker embeddings
+│       ├── transcribe.py        # Whisper API fallback (not used in pipeline)
+│       ├── translate.py         # GPT-4o-mini translation (sequential + context-aware)
+│       ├── synthesize.py        # ElevenLabs local helper (not used in pipeline)
+│       ├── composite.py         # ffmpeg composition + atempo helper
+│       ├── merge.py             # Multi-chunk merge onto original video
+│       └── quality.py           # Segment verification + retry prompts
 ├── frontend/
+│   ├── index.html
 │   ├── package.json
 │   ├── vite.config.js
-│   ├── index.html
+│   ├── tailwind.config.js       # Custom animation utilities
 │   └── src/
-│       └── App.jsx
-└── tmp/                        # git-ignored, runtime files
+│       ├── main.jsx
+│       ├── index.css            # Keyframe animations + range input styling
+│       └── App.jsx              # Pipeline dashboard + synced player
+├── docs/
+│   ├── CONCEPT.md
+│   ├── TECH_SPEC.md             # This file
+│   ├── MODAL_NOTES.md
+│   └── SPENDING_LIMITS.md
+└── tmp/                         # git-ignored, runtime files
     ├── uploads/
     └── outputs/
 ```
 
 ---
 
-## 8. `requirements.txt`
+## 10. `requirements.txt`
 
-**Local requirements** (what you `pip install` on your machine):
+**Local requirements:**
 ```
 fastapi>=0.104.0
 uvicorn>=0.24.0
@@ -1141,24 +519,43 @@ pydub>=0.25.1
 modal>=0.64.0
 ```
 
-> `python-multipart` is required by FastAPI for `UploadFile` handling. Without it, `POST /dub` silently fails.
-
-**Heavy deps** (`pyannote.audio`, `torch`, `torchaudio`) are NOT in local requirements — they're installed inside the Modal GPU image definition (see Section 4). This keeps local install fast and avoids GPU driver issues on dev machines.
+Heavy deps (`pyannote.audio`, `torch`, `torchaudio`, `faster-whisper`) are NOT in local requirements — they're installed inside the Modal image definitions. This keeps local install fast.
 
 ---
 
-## 9. Error Handling Strategy
+## 11. Error Handling
 
-Each pipeline step can fail independently. The orchestrator wraps the entire pipeline in try/except and updates the job status to `"error"` with the exception message.
+| Step | Likely failure | Handling |
+|---|---|---|
+| chunk | ffmpeg scene detection fails | Falls back to single chunk |
+| extract | Corrupt/unsupported video | CalledProcessError → job error |
+| diarize | Bad HF_TOKEN or model terms | RuntimeError → job error |
+| diarize (embeddings) | Embedding model unavailable | try/except, degrades gracefully |
+| transcribe | Whisper model load failure | Container error → job error |
+| translate | OpenAI API rate limit | APIError → job error |
+| synthesize | ElevenLabs char limit / API key | ClientError → job error |
+| quality | All segments fail verification | Accept with speedup after 2 retries |
+| merge | ffmpeg/ffprobe failure | CalledProcessError → job error |
+| Modal | Timeout, OOM, no GPU | Container timeout → job error |
 
-| Step         | Likely failure                          | User-facing message              |
-|--------------|----------------------------------------|----------------------------------|
-| extract      | Corrupt/unsupported video format        | "Could not extract audio from video" |
-| diarize      | Bad HF_TOKEN or model not accepted      | "Speaker identification failed"  |
-| transcribe   | OpenAI API key invalid or rate limited  | "Transcription failed"           |
-| translate    | OpenAI API key invalid or rate limited  | "Translation failed"             |
-| synthesize   | ElevenLabs API key invalid or char limit | "Voice synthesis failed"        |
-| composite    | ffmpeg error or disk full               | "Video composition failed"       |
-| Modal        | Timeout, OOM, or no GPU available       | "Cloud processing failed"        |
+The orchestrator wraps the entire pipeline in try/except and updates job status to `"error"` with the exception message. The `stop_event` for progress polling is initialized before the try block to prevent `UnboundLocalError` in the except handler.
 
-For the hackathon, raw exception messages in the error field are fine. The frontend already displays `status.error`.
+---
+
+## 12. Key Design Decisions
+
+1. **Scene-aware chunking over fixed-time splitting:** Splitting mid-scene can cut a speaker mid-sentence, producing broken transcriptions. Scene boundary detection ensures clean cuts.
+
+2. **Self-hosted Whisper over API:** Eliminates per-minute costs, runs on our own GPU containers, enables parallel transcription via `.map()`, and demonstrates real GPU inference for the Modal prize.
+
+3. **Context-aware translation over per-segment:** Single-segment translation misses conversational flow. Batching 5 segments with speaker labels and durations produces dramatically better dialogue translations.
+
+4. **Global speaker matching over per-chunk synthesis:** Without matching, the same actor would get a different cloned voice in each chunk. Embedding cosine similarity (threshold > 0.85) identifies the same speaker across chunks.
+
+5. **Quality feedback loop over accept-all:** Synthesized audio can be too long, mostly silent, or overlap with the next segment. Verification + re-translation with stricter constraints + re-synthesis catches these issues before the final merge.
+
+6. **Sync function orchestrator over async:** `coordinator.remote()` is a blocking Modal call. Running it inside an `async def` would freeze FastAPI's event loop. Using a sync `def` lets FastAPI run it in a threadpool automatically.
+
+7. **Lazy `modal.Dict` initialization over module-level:** Creating the Dict reference at import time crashes if Modal isn't authenticated. Lazy init defers it to first use (inside a Modal container where auth is guaranteed).
+
+8. **Bytes over paths for cross-container data:** Modal containers have separate filesystems. Voice samples and dubbed audio must be passed as bytes, not file paths.

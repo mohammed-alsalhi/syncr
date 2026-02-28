@@ -6,5 +6,5 @@ aiohttp>=3.9.0
 aiofiles>=23.2.0
 openai>=1.6.0
 pydub>=0.25.1
-audioop-lts>=0.2.2            # required by pydub on Python 3.13+
+audioop-lts>=0.2.2; python_version>="3.13"   # pydub needs this shim on 3.13+
 modal>=0.64.0

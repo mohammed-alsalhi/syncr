@@ -1,6 +1,7 @@
 """
 Step 2: Speaker diarization using pyannote.audio.
-Identifies who speaks when and splits audio into per-segment clips.
+Identifies who speaks when, splits audio into per-segment clips,
+and extracts speaker embeddings for cross-chunk matching.
 """
 
 import os
@@ -10,19 +11,22 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
     """
     Run speaker diarization on audio and split into per-segment clips.
 
+    Also computes a representative embedding per speaker using pyannote's
+    embedding model, stored in the segment dicts for cross-chunk speaker
+    matching by the coordinator.
+
     Args:
         audio_path: Path to WAV audio file (16kHz mono)
         work_dir:   Directory to write segment audio files
 
     Returns:
         List of segment dicts sorted by start time:
-        [{"speaker": "SPEAKER_00", "start": 0.5, "end": 3.2, "audio_path": "..."}]
-
-    Raises:
-        RuntimeError: If pyannote model fails to load (bad HF_TOKEN or no model access)
+        [{"speaker": "SPEAKER_00", "start": 0.5, "end": 3.2,
+          "audio_path": "...", "embedding": [0.1, 0.2, ...]}]
     """
     import torch
-    from pyannote.audio import Pipeline
+    import numpy as np
+    from pyannote.audio import Pipeline, Inference
     from pydub import AudioSegment
 
     hf_token = os.environ["HF_TOKEN"]
@@ -32,8 +36,8 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
         token=hf_token,
     )
 
-    if torch.cuda.is_available():
-        pipeline.to(torch.device("cuda"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pipeline.to(device)
 
     output = pipeline(audio_path)
 
@@ -69,4 +73,42 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
         })
 
     segments.sort(key=lambda s: s["start"])
+
+    # ── Extract speaker embeddings ──
+    # Use pyannote's embedding model to compute a representative vector
+    # per speaker. The coordinator uses these for cross-chunk matching.
+    try:
+        embedding_model = Inference(
+            "pyannote/wespeaker-voxceleb-resnet34-LM",
+            token=hf_token,
+            window="whole",
+        )
+        embedding_model.to(device)
+
+        # Compute embedding from the longest segment per speaker
+        speaker_best_seg: dict[str, dict] = {}
+        for seg in segments:
+            spk = seg["speaker"]
+            if spk not in speaker_best_seg or (seg["end"] - seg["start"]) > (speaker_best_seg[spk]["end"] - speaker_best_seg[spk]["start"]):
+                speaker_best_seg[spk] = seg
+
+        speaker_embeddings: dict[str, list[float]] = {}
+        for spk, seg in speaker_best_seg.items():
+            emb = embedding_model(seg["audio_path"])
+            # pyannote returns a numpy array
+            if isinstance(emb, np.ndarray):
+                speaker_embeddings[spk] = emb.tolist()
+            else:
+                speaker_embeddings[spk] = list(emb)
+
+        # Attach embedding to each segment
+        for seg in segments:
+            seg["embedding"] = speaker_embeddings.get(seg["speaker"], [])
+
+    except Exception:
+        # Embedding extraction is best-effort — if it fails, segments
+        # still work, just without cross-chunk matching capability
+        for seg in segments:
+            seg["embedding"] = []
+
     return segments
