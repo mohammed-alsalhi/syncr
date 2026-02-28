@@ -1,6 +1,6 @@
 """
 Pipeline Orchestrator
-Calls Modal for the full pipeline and simulates progress locally.
+Calls Modal coordinator and polls real progress via modal.Dict.
 """
 
 import time
@@ -9,84 +9,89 @@ from pathlib import Path
 from models import JobStatus
 
 
-def update_job(jobs: dict, job_id: str, status: str, step: str, progress: int, error: str = None):
-    jobs[job_id] = JobStatus(
-        job_id=job_id,
-        status=status,
-        step=step,
-        progress=progress,
-        error=error,
-        output_url=f"/download/{job_id}" if status == "done" else None,
-    )
+def _update_job(jobs: dict, job_id: str, **kwargs):
+    """Merge partial updates into the current job status."""
+    current = jobs[job_id].model_dump()
+    current.update(kwargs)
+    # Set output_url when done
+    if current.get("status") == "done":
+        current["output_url"] = f"/download/{job_id}"
+    jobs[job_id] = JobStatus(**current)
 
 
-# Simulated progress steps: (label, start_pct, end_pct, estimated_seconds)
-PROGRESS_STEPS = [
-    ("Extracting audio...",           5,  10,  3),
-    ("Identifying speakers...",      10,  25, 15),
-    ("Transcribing speech...",       25,  40, 10),
-    ("Translating dialogue...",      40,  55,  8),
-    ("Cloning voices (parallel)...", 55,  75, 20),
-    ("Compositing final video...",   75,  90, 10),
-]
-
-
-def _simulate_progress(jobs: dict, job_id: str, stop_event: threading.Event):
+def _poll_modal_progress(jobs: dict, job_id: str, stop_event: threading.Event):
     """
-    Advance the progress bar through estimated step timings.
-    Runs in a background thread. Stops when stop_event is set
-    (i.e., when the Modal call returns).
+    Poll modal.Dict for real progress updates written by Modal containers.
+    Runs in a background thread. Stops when stop_event is set.
     """
-    for step_name, start_pct, end_pct, duration_s in PROGRESS_STEPS:
-        if stop_event.is_set():
-            return
-        update_job(jobs, job_id, "running", step_name, start_pct)
-        intervals = max(duration_s, 1)
-        for tick in range(intervals):
-            if stop_event.is_set():
-                return
-            time.sleep(1)
-            pct = start_pct + int((end_pct - start_pct) * (tick + 1) / intervals)
-            update_job(jobs, job_id, "running", step_name, pct)
+    import modal
+
+    progress_dict = modal.Dict.from_name("syncr-progress", create_if_missing=True)
+
+    while not stop_event.is_set():
+        try:
+            data = progress_dict.get(job_id)
+            if data and isinstance(data, dict):
+                _update_job(
+                    jobs, job_id,
+                    status=data.get("status", "running"),
+                    step=data.get("step", "Processing..."),
+                    progress=data.get("progress", jobs[job_id].progress),
+                    total_chunks=data.get("total_chunks"),
+                    completed_chunks=data.get("completed_chunks"),
+                    speakers_found=data.get("speakers_found"),
+                    segments_found=data.get("segments_found"),
+                    containers_active=data.get("containers_active"),
+                    containers_total=data.get("containers_total"),
+                    transcript_preview=data.get("transcript_preview"),
+                    step_timings=data.get("step_timings"),
+                )
+        except Exception:
+            pass  # Dict may not exist yet or container hasn't written yet
+        time.sleep(1)
 
 
-async def run_pipeline(
+def run_pipeline(
     job_id: str,
     input_path: str,
     target_language: str,
     jobs: dict,
     output_dir: str,
 ):
+    """
+    Run the full dubbing pipeline. This is a sync function — FastAPI's
+    BackgroundTasks runs it in a threadpool so it doesn't block the event loop.
+    """
+    stop_event = threading.Event()
     try:
-        update_job(jobs, job_id, "running", "Starting...", 2)
+        _update_job(jobs, job_id, status="running", step="Starting...", progress=1)
 
         with open(input_path, "rb") as f:
             video_bytes = f.read()
 
-        # Start simulated progress in background thread
-        stop_event = threading.Event()
+        # Start polling real progress from modal.Dict
         progress_thread = threading.Thread(
-            target=_simulate_progress, args=(jobs, job_id, stop_event), daemon=True,
+            target=_poll_modal_progress, args=(jobs, job_id, stop_event), daemon=True,
         )
         progress_thread.start()
 
-        # Call Modal — blocks until pipeline completes
-        from pipeline.modal_jobs import run_pipeline_remote
-        output_bytes = run_pipeline_remote.remote(video_bytes, target_language)
+        # Call Modal coordinator — blocks until full pipeline completes
+        from pipeline.modal_jobs import coordinator
+        output_bytes = coordinator.remote(video_bytes, target_language, job_id)
 
-        # Stop simulated progress
+        # Stop progress polling
         stop_event.set()
         progress_thread.join(timeout=2)
 
         # Save output locally
-        update_job(jobs, job_id, "running", "Saving output...", 95)
+        _update_job(jobs, job_id, status="running", step="Saving output...", progress=98)
         output_path = Path(output_dir) / f"{job_id}_dubbed.mp4"
         with open(output_path, "wb") as f:
             f.write(output_bytes)
 
-        update_job(jobs, job_id, "done", "Complete!", 100)
+        _update_job(jobs, job_id, status="done", step="Complete!", progress=100)
 
     except Exception as e:
         stop_event.set()
-        update_job(jobs, job_id, "error", "Pipeline failed", 0, error=str(e))
+        _update_job(jobs, job_id, status="error", step="Pipeline failed", progress=0, error=str(e))
         raise
