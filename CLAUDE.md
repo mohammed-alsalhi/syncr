@@ -6,23 +6,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Syncr (Mimic) is an AI dubbing studio built for HackIllinois 2026. Upload a video and every actor speaks a target language in their own cloned voice with lip-sync-aware pacing. Full-stack app: React/Vite frontend + FastAPI/Python backend, orchestrated via Modal for GPU-parallel processing.
 
+## Repository Structure
+
+```
+syncr/
+├── backend/
+│   ├── main.py                 # FastAPI server (3 endpoints)
+│   ├── models.py               # Pydantic models (JobStatus, DubRequest)
+│   ├── requirements.txt
+│   ├── .env.example
+│   └── pipeline/
+│       ├── modal_app.py        # Modal App + Image definitions
+│       ├── modal_jobs.py       # Modal functions (orchestrator + per-speaker synth)
+│       ├── orchestrator.py     # Local orchestrator (calls Modal, simulates progress)
+│       ├── extract.py          # Step 1: ffmpeg audio extraction
+│       ├── diarize.py          # Step 2: pyannote speaker diarization (GPU)
+│       ├── transcribe.py       # Step 3: Whisper transcription
+│       ├── translate.py        # Step 4: GPT-4o-mini translation
+│       ├── synthesize.py       # Step 5: ElevenLabs voice cloning + TTS
+│       └── composite.py        # Step 6: ffmpeg video composition
+├── frontend/
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   └── src/
+│       ├── main.jsx
+│       ├── index.css
+│       └── App.jsx             # Single-page React UI
+├── docs/
+│   ├── CONCEPT.md              # Original project concept
+│   ├── TECH_SPEC.md            # Detailed technical specification
+│   ├── MODAL_NOTES.md          # Modal platform reference
+│   └── SPENDING_LIMITS.md      # API cost guardrails
+└── README.md
+```
+
 ## Architecture
 
-```
-Video → Extract Audio (ffmpeg)
-     → Diarize Speakers (pyannote.audio via Modal GPU)
-     → Transcribe (OpenAI Whisper)
-     → Translate (GPT-4o, timing-aware prompts)
-     → Clone Voices + Synthesize (ElevenLabs, parallel per speaker)
-     → Composite back onto video (ffmpeg)
-     → Output: dubbed video
-```
+One GPU container on Modal runs the sequential pipeline steps (extract → diarize → transcribe → translate), then spawns parallel CPU containers for per-speaker voice synthesis. Results composited back in the GPU container.
 
-**Backend (FastAPI):** 3 endpoints — `POST /dub` (upload + start job), `GET /status/{job_id}` (poll progress), `GET /download/{job_id}` (get result). Jobs tracked in-memory by UUID. Pipeline runs as background task via `orchestrator.run_pipeline()`.
+**Backend (FastAPI):** 3 endpoints — `POST /dub`, `GET /status/{job_id}`, `GET /download/{job_id}`. Jobs tracked in-memory. Orchestrator calls Modal via `.remote()` and simulates progress locally.
 
-**Frontend (React/Vite):** Single-page `App.jsx`. Upload dropzone → language picker → polls `/status` every 2s → side-by-side video player (original vs dubbed) → download.
-
-**Pipeline modules** (in `backend/pipeline/`): `extract.py`, `diarize.py`, `transcribe.py`, `translate.py`, `synthesize.py`, `composite.py`, `modal_jobs.py`. Each step updates job progress (5% → 15% → 30% → 45% → 60% → 85% → 100%).
+**Frontend (React/Vite):** Upload dropzone → language picker → polls `/status` every 2s → before/after video player → download.
 
 ## Commands
 
@@ -42,38 +68,32 @@ npm install
 npm run dev                        # http://localhost:5173
 ```
 
-### Test pipeline
+### Test pipeline on Modal
 ```bash
 cd backend
-modal run pipeline/modal_jobs.py   # test Modal diarization
+modal run pipeline/modal_jobs.py
 ```
-
-### Spike tests (run in order)
-1. **Diarization quality** — extract audio + diarize locally, check speaker labels
-2. **Voice cloning** — clone a speaker via ElevenLabs, synthesize a test segment
-3. **End-to-end** — 30-second clip through full pipeline via API
-
-See README.md for exact spike test commands.
 
 ## Environment Variables
 
-Required in `backend/.env`:
-- `OPENAI_API_KEY` — GPT-4o translation + Whisper transcription
+Required in `backend/.env` (copy from `backend/.env.example`):
+- `OPENAI_API_KEY` — GPT-4o-mini translation + Whisper transcription
 - `ELEVENLABS_API_KEY` — voice cloning and TTS
 - `HF_TOKEN` — HuggingFace (pyannote model access)
 
-Modal secrets created separately via `modal secret create mimic-secrets`.
+Modal secrets: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=... ELEVENLABS_API_KEY=...`
 
 ## Key Conventions
 
-- **Async throughout** — backend uses `async/await` with `aiohttp` and `aiofiles` for concurrent API calls
 - **Segment data as dicts** — `{speaker, start, end, audio_path, text, translated_text, dubbed_audio_path}`
-- **Parallel per-speaker processing** — voice cloning and synthesis run concurrently per speaker via Modal containers
-- **Temp files** — uploads in `tmp/uploads/`, outputs in `tmp/outputs/`, intermediate segments in `tmp/segments/`
+- **Modal hybrid architecture** — GPU container for sequential steps, `.spawn()` for parallel per-speaker synthesis
+- **Bytes over paths for cross-container data** — synth containers receive/return audio as bytes since they have separate filesystems
+- **Timing-aware translation** — GPT prompt includes segment duration to constrain translation length
+- **Voice cleanup** — delete ElevenLabs cloned voices after each job (free tier: 3 voice limit)
 - **Frontend env** — API URL via `import.meta.env.VITE_API_URL`, defaults to `http://localhost:8000`
 
 ## External Dependencies
 
-- **ffmpeg** must be installed locally
+- **ffmpeg** must be installed locally and in Modal images
 - **HuggingFace model access** required: accept terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`
 - **Modal** for GPU container orchestration (`modal setup` + `modal token new`)

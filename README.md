@@ -1,4 +1,4 @@
-# 🎭 Syncr — AI Dubbing Studio
+# Syncr — AI Dubbing Studio
 
 > Upload any video. Every actor speaks your target language — in their own voice — in minutes.
 
@@ -9,9 +9,11 @@ Built for HackIllinois 2026. Powered by Modal, ElevenLabs, OpenAI, and pyannote.
 ## Architecture
 
 ```
-Video → Extract Audio → Diarize Speakers (Modal/pyannote)
-     → Transcribe (Whisper) → Translate (GPT-4o)
-     → Clone Voices + Synthesize (ElevenLabs, parallel)
+Video → Extract Audio (ffmpeg)
+     → Diarize Speakers (Modal GPU / pyannote)
+     → Transcribe (Whisper)
+     → Translate (GPT-4o-mini, timing-aware)
+     → Clone Voices + Synthesize (ElevenLabs, parallel per speaker)
      → Composite back onto video (ffmpeg)
 ```
 
@@ -24,7 +26,7 @@ Video → Extract Audio → Diarize Speakers (Modal/pyannote)
 - Node 18+
 - ffmpeg installed locally (`brew install ffmpeg` or `apt install ffmpeg`)
 
-### 1. Clone and install backend
+### 1. Install backend
 
 ```bash
 cd backend
@@ -43,8 +45,7 @@ cp .env.example .env
 ### 3. Set up Modal
 
 ```bash
-# Install and authenticate
-pip install modal
+# Authenticate
 modal setup              # opens browser for auth
 modal token new          # confirm token is saved
 
@@ -71,7 +72,7 @@ Visit these pages and click "Accept":
 
 ```bash
 cd backend
-source venv/bin/activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 uvicorn main:app --reload --port 8000
 ```
 
@@ -85,66 +86,61 @@ npm run dev              # starts at http://localhost:5173
 
 ---
 
-## Test the pipeline (before running the full server)
-
-```bash
-# Test Modal diarization directly
-cd backend
-modal run pipeline/modal_jobs.py
-
-# Or run diarization locally (no Modal needed, slower)
-python -c "
-from pipeline.extract import extract_audio
-from pipeline.diarize import diarize_speakers
-audio = extract_audio('your_test_video.mp4', 'test')
-segments = diarize_speakers(audio)
-print(segments[:3])
-"
-```
-
----
-
 ## Spike tests (do these first, in order)
 
 ### Spike 1: Diarization quality
 ```bash
-# Put a video in tmp/ and run:
+cd backend
+source venv/bin/activate
 python -c "
 from pipeline.extract import extract_audio
-from pipeline.diarize import _diarize_local
-audio = extract_audio('tmp/test.mp4', 'spike1')
-segs = _diarize_local(audio)
+from pipeline.diarize import diarize_speakers
+audio = extract_audio('tmp/test.mp4', 'spike1', 'tmp')
+segs = diarize_speakers(audio, 'tmp')
 for s in segs: print(s)
 "
 ```
-✅ Pass: distinct speaker labels, reasonable timestamps
-❌ Fail: all one speaker, or too fragmented (tune pyannote min_duration_on)
+Pass: distinct speaker labels, reasonable timestamps
+Fail: all one speaker, or too fragmented (tune pyannote min_duration_on)
 
 ### Spike 2: ElevenLabs voice cloning
 ```bash
+cd backend
+source venv/bin/activate
 python -c "
-import asyncio, aiohttp, aiofiles, os
+import asyncio, aiohttp, os
 from dotenv import load_dotenv
 load_dotenv()
 
+from pipeline.synthesize import _clone_voice, _synthesize_segment
+
 async def test():
-    from pipeline.synthesize import _clone_voice, _synthesize_segment
+    api_key = os.environ['ELEVENLABS_API_KEY']
     async with aiohttp.ClientSession() as session:
-        speaker, voice_id = await _clone_voice(session, 'SPEAKER_00', 'tmp/segments/seg_0000_SPEAKER_00.wav', 'test')
+        speaker, voice_id = await _clone_voice(session, api_key, 'SPEAKER_00', 'tmp/segments/seg_0000_SPEAKER_00.wav', 'test')
         print('Voice ID:', voice_id)
-        seg = {'speaker': 'SPEAKER_00', 'translated_text': 'Hello, this is a test.', 'start': 0, 'end': 2, 'dubbed_audio_path': None}
-        result = await _synthesize_segment(session, seg, voice_id, 0)
+        seg = {'speaker': 'SPEAKER_00', 'translated_text': 'Hello, this is a test.', 'start': 0, 'end': 2}
+        result = await _synthesize_segment(session, api_key, seg, voice_id, 0, 'tmp/dubbed')
         print('Synthesized:', result)
 
 asyncio.run(test())
 "
 ```
-✅ Pass: audio file created, sounds like the speaker
-❌ Fail: check ELEVENLABS_API_KEY and that sample is >5 seconds
+Pass: audio file created, sounds like the speaker
+Fail: check ELEVENLABS_API_KEY and that sample is >5 seconds
 
 ### Spike 3: End-to-end on a 30-second clip
 Pick a short clip with 2 speakers. Run the full pipeline via the API.
 Target: output video where voices match original speakers.
+
+---
+
+## Test Modal deployment
+
+```bash
+cd backend
+modal run pipeline/modal_jobs.py
+```
 
 ---
 
@@ -163,3 +159,12 @@ Target: output video where voices match original speakers.
 > We built Mimic. Give it any video and every actor speaks another language — in their own voice."
 
 [Play original clip → Play dubbed clip]
+
+---
+
+## Docs
+
+- [docs/TECH_SPEC.md](docs/TECH_SPEC.md) — Full technical specification
+- [docs/MODAL_NOTES.md](docs/MODAL_NOTES.md) — Modal platform reference
+- [docs/SPENDING_LIMITS.md](docs/SPENDING_LIMITS.md) — API cost guardrails
+- [docs/CONCEPT.md](docs/CONCEPT.md) — Original project concept
