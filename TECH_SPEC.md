@@ -5,19 +5,32 @@
 Syncr is a video dubbing pipeline that takes an input video and produces a dubbed version where every speaker's voice is cloned and speaks the target language. The entire compute-heavy pipeline runs on Modal (serverless GPU cloud). A local FastAPI server handles uploads, job tracking, and serves results.
 
 ```
-┌──────────┐       POST /dub       ┌─────────────┐     .remote()     ┌──────────────────────┐
-│ Frontend │ ───────────────────→  │ FastAPI      │ ────────────────→ │ Modal Cloud          │
-│ (React)  │ ←── GET /status ────  │ (local)      │ ←── return ─────  │                      │
-│          │ ←── GET /download ──  │              │                   │ extract (CPU)        │
-└──────────┘                       └─────────────┘                   │ diarize (GPU)        │
-                                                                     │ transcribe (CPU)     │
-                                                                     │ translate (CPU)      │
-                                                                     │ synthesize (CPU)     │
-                                                                     │ composite (CPU)      │
-                                                                     └──────────────────────┘
+┌──────────┐       POST /dub       ┌─────────────┐     .remote()     ┌──────────────────────────────┐
+│ Frontend │ ───────────────────→  │ FastAPI      │ ────────────────→ │ Modal Cloud                  │
+│ (React)  │ ←── GET /status ────  │ (local)      │ ←── return ─────  │                              │
+│          │ ←── GET /download ──  │              │                   │ ┌────────────────────────┐   │
+└──────────┘                       └─────────────┘                   │ │ Orchestrator container │   │
+                                                                     │ │ (GPU — T4)             │   │
+                                                                     │ │ extract → diarize →    │   │
+                                                                     │ │ transcribe → translate  │   │
+                                                                     │ └──────────┬─────────────┘   │
+                                                                     │            │ .spawn() per     │
+                                                                     │            │ speaker          │
+                                                                     │  ┌─────────▼──────────┐      │
+                                                                     │  │ Synth containers   │      │
+                                                                     │  │ (CPU, 1 per speaker)│      │
+                                                                     │  │ clone + synthesize  │      │
+                                                                     │  └─────────┬──────────┘      │
+                                                                     │            │                  │
+                                                                     │  ┌─────────▼──────────┐      │
+                                                                     │  │ Composite (CPU)    │      │
+                                                                     │  └────────────────────┘      │
+                                                                     └──────────────────────────────┘
 ```
 
-**Data flow:** Video file → FastAPI saves to disk → orchestrator calls Modal function → Modal runs 6-step pipeline → output video saved to disk → FastAPI serves download.
+**Data flow:** Video file → FastAPI saves to disk → orchestrator calls Modal function → Modal runs pipeline (extract → diarize → transcribe → translate on one GPU container, then spawns parallel CPU containers for per-speaker voice synthesis) → composite → output video returned as bytes → FastAPI saves to disk and serves download.
+
+**Why this architecture matters for judging:** The synthesis step spawns N containers simultaneously (one per speaker). For a clip with 3 speakers, judges see 3 containers fire in parallel on the Modal dashboard. This is genuinely load-bearing — synthesis is the slowest step and the parallelism produces a real speedup. The rest of the pipeline runs sequentially because each step depends on the previous one's output.
 
 ---
 
@@ -182,31 +195,24 @@ def extract_audio(input_path: str, job_id: str) -> str:
 3. Each Modal function reads/writes inside `/workspace/`
 4. After pipeline completes, download the output from the volume back to local disk
 
-**Alternative (simpler for hackathon):** Run the entire pipeline as a single Modal function that receives the video bytes and returns the dubbed video bytes. This avoids volume complexity:
+**Architecture: hybrid approach (recommended).** One orchestrator function runs on a GPU container and handles the sequential steps (extract, diarize, transcribe, translate). It then spawns separate CPU containers for voice synthesis — one per speaker, running in parallel. Finally, composite runs in the orchestrator container.
+
+This gives you the best of both worlds: simple sequential flow where needed, visible parallelism for the Modal track judges, and a real speedup on the slowest step.
 
 ```python
-@app.function(image=gpu_image, gpu="T4", timeout=600, concurrency_limit=2,
-              secrets=[modal.Secret.from_name("mimic-secrets")])
-def run_full_pipeline(video_bytes: bytes, target_language: str) -> bytes:
-    """Receive video bytes, return dubbed video bytes. Everything runs in one container."""
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.mp4")
-        with open(input_path, "wb") as f:
-            f.write(video_bytes)
+# pipeline/modal_jobs.py — see Section 6 for full implementation
+@app.function(image=gpu_image, gpu="T4", ...)
+def run_pipeline_remote(video_bytes: bytes, target_language: str) -> bytes:
+    # sequential: extract → diarize → transcribe → translate
+    # parallel:   spawn synthesize_speaker.spawn() per speaker
+    # sequential: composite
+    ...
 
-        audio_path = _extract_audio(input_path, tmpdir)
-        segments = _diarize_speakers(audio_path, tmpdir)
-        segments = _transcribe_segments(segments)
-        segments = _translate_segments(segments, target_language)
-        segments = _synthesize_speakers(segments, tmpdir)
-        output_path = _composite_video(input_path, segments, tmpdir)
-
-        with open(output_path, "rb") as f:
-            return f.read()
+@app.function(image=cpu_image, ...)
+def synthesize_speaker(speaker: str, segments: list[dict], sample_bytes: bytes, ...) -> list[dict]:
+    # clone voice + synthesize all segments for one speaker
+    ...
 ```
-
-> **Recommendation for hackathon:** Start with the single-function approach. It eliminates file transfer complexity. You only need one container with the GPU image. Refactor to multi-function only if you need per-step parallelism.
 
 ---
 
@@ -741,12 +747,14 @@ def composite_video(
         # If dubbed audio is longer than the original slot, speed it up
         if len(dubbed_clip) > target_duration_ms and target_duration_ms > 0:
             speed_factor = len(dubbed_clip) / target_duration_ms
-            # Use ffmpeg to change speed without pitch shift
+            # Build atempo filter chain — each atempo filter maxes at 2.0,
+            # so chain them for higher ratios (e.g., 3x = atempo=2.0,atempo=1.5)
+            atempo_chain = _build_atempo_chain(speed_factor)
             sped_up_path = seg["dubbed_audio_path"] + ".speed.wav"
             subprocess.run([
                 "ffmpeg", "-y",
                 "-i", seg["dubbed_audio_path"],
-                "-filter:a", f"atempo={min(speed_factor, 2.0)}",  # atempo max 2.0
+                "-filter:a", atempo_chain,
                 sped_up_path,
             ], check=True, capture_output=True)
             dubbed_clip = AudioSegment.from_file(sped_up_path)
@@ -776,9 +784,28 @@ def composite_video(
     return output_path
 ```
 
+**`_build_atempo_chain` helper:**
+```python
+def _build_atempo_chain(speed_factor: float) -> str:
+    """
+    Build an ffmpeg atempo filter chain for arbitrary speedup.
+    Each atempo filter is capped at 2.0x, so we chain multiple
+    for higher ratios. E.g., 3.0x → "atempo=2.0,atempo=1.5"
+    Cap total speedup at 4.0x to avoid unintelligible audio.
+    """
+    speed_factor = min(speed_factor, 4.0)
+    filters = []
+    remaining = speed_factor
+    while remaining > 1.0:
+        chunk = min(remaining, 2.0)
+        filters.append(f"atempo={chunk:.4f}")
+        remaining /= chunk
+    return ",".join(filters) if filters else "atempo=1.0"
+```
+
 **Key decisions:**
 - **Silent base track:** Start with silence, overlay dubbed clips at their timestamps. Gaps between segments are naturally silent.
-- **Speed adjustment:** If the dubbed audio is longer than the original segment's time window, speed it up using ffmpeg's `atempo` filter (max 2x). This is the practical lip-sync timing solution.
+- **Speed adjustment:** If the dubbed audio is longer than the original segment's time window, speed it up using chained `atempo` filters. Each `atempo` maxes at 2.0x, so we chain them (e.g., 3x = `atempo=2.0,atempo=1.5`). Total speedup is capped at 4.0x — beyond that, speech becomes unintelligible anyway. This matters for Arabic and German translations, which tend to be wordier than English.
 - **Video passthrough:** `-c:v copy` copies the video stream without re-encoding. This is fast and lossless.
 - **Output format:** MP4 with original video + new audio.
 
@@ -786,13 +813,103 @@ def composite_video(
 
 ## 6. Orchestrator — Modal Integration
 
-The orchestrator ties everything together. For the hackathon, run the entire pipeline as a single Modal function.
+The orchestrator uses a hybrid approach: one GPU container runs the sequential steps, then spawns parallel CPU containers for per-speaker synthesis.
 
 ### `pipeline/modal_jobs.py`
 
 ```python
 import modal
-from modal_app import app, gpu_image, vol
+from pipeline.modal_app import app, gpu_image, cpu_image
+
+# ── Per-speaker synthesis (spawned in parallel) ─────────────────────────────
+
+@app.function(
+    image=cpu_image,
+    timeout=300,
+    concurrency_limit=6,
+    secrets=[modal.Secret.from_name("mimic-secrets")],
+)
+def synthesize_speaker(
+    speaker: str,
+    segments: list[dict],
+    sample_bytes: bytes,
+    job_id: str,
+) -> list[dict]:
+    """
+    Clone one speaker's voice and synthesize all their segments.
+    Runs in its own container — one container per speaker, all in parallel.
+
+    Args:
+        speaker:      Speaker label ("SPEAKER_00")
+        segments:     All translated segments for this speaker
+        sample_bytes: Raw audio bytes of the best voice sample for cloning
+        job_id:       Job identifier for voice clone naming
+
+    Returns:
+        List of segment dicts with dubbed_audio_bytes added (bytes, not paths —
+        since each container has its own filesystem).
+    """
+    import asyncio
+    import os
+    import aiohttp
+    import tempfile
+
+    ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
+    api_key = os.environ["ELEVENLABS_API_KEY"]
+
+    async def _run():
+        async with aiohttp.ClientSession() as session:
+            # Clone voice
+            headers = {"xi-api-key": api_key}
+            form = aiohttp.FormData()
+            form.add_field("name", f"{job_id}_{speaker}")
+            form.add_field("files", sample_bytes, filename=f"{speaker}.wav", content_type="audio/wav")
+            async with session.post(f"{ELEVENLABS_BASE}/voices/add", headers=headers, data=form) as resp:
+                resp.raise_for_status()
+                voice_id = (await resp.json())["voice_id"]
+
+            # Synthesize all segments for this speaker
+            results = []
+            for seg in segments:
+                if not seg.get("translated_text", "").strip():
+                    continue
+
+                payload = {
+                    "text": seg["translated_text"],
+                    "model_id": "eleven_multilingual_v2",
+                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                }
+                headers_tts = {
+                    "xi-api-key": api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                }
+                async with session.post(
+                    f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}",
+                    headers=headers_tts, json=payload,
+                ) as resp:
+                    resp.raise_for_status()
+                    audio_bytes = await resp.read()
+
+                results.append({
+                    "speaker": seg["speaker"],
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "dubbed_audio_bytes": audio_bytes,
+                })
+
+            # Cleanup: delete cloned voice
+            async with session.delete(
+                f"{ELEVENLABS_BASE}/voices/{voice_id}", headers={"xi-api-key": api_key}
+            ) as resp:
+                pass  # best-effort
+
+            return results
+
+    return asyncio.run(_run())
+
+
+# ── Main orchestrator (GPU container) ────────────────────────────────────────
 
 @app.function(
     image=gpu_image,
@@ -803,10 +920,10 @@ from modal_app import app, gpu_image, vol
 )
 def run_pipeline_remote(video_bytes: bytes, target_language: str) -> bytes:
     """
-    Full pipeline in one container. Receives video bytes, returns dubbed video bytes.
-    GPU needed for pyannote diarization.
+    Main pipeline orchestrator. Runs on GPU for diarization.
+    Spawns parallel containers for synthesis.
     """
-    import tempfile, os
+    import tempfile, os, asyncio
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Save input
@@ -814,34 +931,81 @@ def run_pipeline_remote(video_bytes: bytes, target_language: str) -> bytes:
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
-        # Run pipeline
-        from extract import extract_audio
-        from diarize import diarize_speakers
-        from transcribe import transcribe_segments
-        from translate import translate_segments
-        from synthesize import synthesize_speakers
-        from composite import composite_video
-
-        import asyncio
+        # ── Sequential steps (all in this container) ──
+        from pipeline.extract import extract_audio
+        from pipeline.diarize import diarize_speakers
+        from pipeline.transcribe import transcribe_segments
+        from pipeline.translate import translate_segments
+        from pipeline.composite import composite_video
 
         audio_path = extract_audio(input_path, "job", tmpdir)
         segments = diarize_speakers(audio_path, tmpdir)
         segments = transcribe_segments(segments)
         segments = translate_segments(segments, target_language)
-        segments = asyncio.run(synthesize_speakers(segments, "job", tmpdir))
-        output_path = composite_video(input_path, segments, "job", os.path.join(tmpdir, "output"))
 
-        # Return output bytes
+        # ── Parallel synthesis (spawn one container per speaker) ──
+        speakers = {}
+        for seg in segments:
+            speakers.setdefault(seg["speaker"], []).append(seg)
+
+        # Read voice samples (longest clip per speaker)
+        speaker_samples = {}
+        for spk, segs in speakers.items():
+            best = max(segs, key=lambda s: s["end"] - s["start"])
+            with open(best["audio_path"], "rb") as f:
+                speaker_samples[spk] = f.read()
+
+        # Spawn parallel containers
+        handles = []
+        for spk, segs in speakers.items():
+            # Strip audio_path (not accessible from synth container)
+            clean_segs = [
+                {k: v for k, v in s.items() if k != "audio_path"} for s in segs
+            ]
+            handle = synthesize_speaker.spawn(spk, clean_segs, speaker_samples[spk], "job")
+            handles.append(handle)
+
+        # Collect results from all containers
+        synthesized = []
+        dub_dir = os.path.join(tmpdir, "dubbed")
+        os.makedirs(dub_dir, exist_ok=True)
+
+        for handle in handles:
+            speaker_results = handle.get()
+            for i, seg in enumerate(speaker_results):
+                # Write audio bytes to disk for compositing
+                dub_path = os.path.join(dub_dir, f"dub_{seg['speaker']}_{i:04d}.mp3")
+                with open(dub_path, "wb") as f:
+                    f.write(seg["dubbed_audio_bytes"])
+                synthesized.append({
+                    "speaker": seg["speaker"],
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "dubbed_audio_path": dub_path,
+                })
+
+        # ── Composite (back in this container) ──
+        output_path = composite_video(input_path, synthesized, "job", os.path.join(tmpdir, "output"))
+
         with open(output_path, "rb") as f:
             return f.read()
 ```
 
+**Key detail: `.spawn()` vs `.remote()`.** Using `synthesize_speaker.spawn()` returns a handle immediately without blocking. This launches all speaker containers simultaneously. Then `handle.get()` collects each result. For a 3-speaker clip, the Modal dashboard shows 1 GPU container + 3 CPU containers running at the same time.
+
+**Why bytes instead of paths:** Each spawned container has its own filesystem. The synth containers can't read files from the orchestrator container. So we pass `sample_bytes` in and return `dubbed_audio_bytes` out. The orchestrator writes them to disk for the composite step.
+
 ### Updated `pipeline/orchestrator.py`
+
+The local orchestrator calls Modal and simulates progress on the client side.
 
 ```python
 import asyncio
+import time
+import threading
 from pathlib import Path
 from models import JobStatus
+
 
 def update_job(jobs, job_id, status, step, progress, error=None):
     jobs[job_id] = JobStatus(
@@ -850,22 +1014,62 @@ def update_job(jobs, job_id, status, step, progress, error=None):
         output_url=f"/download/{job_id}" if status == "done" else None,
     )
 
+
+# Simulated progress steps with estimated durations (seconds)
+PROGRESS_STEPS = [
+    ("Extracting audio...",              5,  10,  3),
+    ("Identifying speakers...",         10,  25, 15),
+    ("Transcribing speech...",          25,  40, 10),
+    ("Translating dialogue...",         40,  55,  8),
+    ("Cloning voices (parallel)...",    55,  75, 20),
+    ("Compositing final video...",      75,  90, 10),
+]
+
+
+def _simulate_progress(jobs, job_id, stop_event: threading.Event):
+    """
+    Advance the progress bar through estimated step timings.
+    Runs in a background thread. Stops when stop_event is set
+    (i.e., when the Modal call returns).
+    """
+    for step_name, start_pct, end_pct, duration_s in PROGRESS_STEPS:
+        if stop_event.is_set():
+            return
+        update_job(jobs, job_id, "running", step_name, start_pct)
+        # Interpolate progress within this step
+        intervals = max(duration_s, 1)
+        for tick in range(intervals):
+            if stop_event.is_set():
+                return
+            time.sleep(1)
+            pct = start_pct + int((end_pct - start_pct) * (tick + 1) / intervals)
+            update_job(jobs, job_id, "running", step_name, pct)
+
+
 async def run_pipeline(job_id, input_path, target_language, jobs, output_dir):
     try:
-        update_job(jobs, job_id, "running", "Uploading to cloud...", 5)
+        update_job(jobs, job_id, "running", "Starting...", 2)
 
-        # Read video file
         with open(input_path, "rb") as f:
             video_bytes = f.read()
 
-        update_job(jobs, job_id, "running", "Processing on cloud (this takes a few minutes)...", 15)
+        # Start simulated progress in background thread
+        stop_event = threading.Event()
+        progress_thread = threading.Thread(
+            target=_simulate_progress, args=(jobs, job_id, stop_event), daemon=True,
+        )
+        progress_thread.start()
 
-        # Call Modal — entire pipeline runs remotely
+        # Call Modal — blocks until pipeline completes
         from pipeline.modal_jobs import run_pipeline_remote
         output_bytes = run_pipeline_remote.remote(video_bytes, target_language)
 
+        # Stop simulated progress
+        stop_event.set()
+        progress_thread.join(timeout=2)
+
         # Save output locally
-        update_job(jobs, job_id, "running", "Saving output...", 90)
+        update_job(jobs, job_id, "running", "Saving output...", 95)
         output_path = Path(output_dir) / f"{job_id}_dubbed.mp4"
         with open(output_path, "wb") as f:
             f.write(output_bytes)
@@ -873,11 +1077,12 @@ async def run_pipeline(job_id, input_path, target_language, jobs, output_dir):
         update_job(jobs, job_id, "done", "Complete!", 100)
 
     except Exception as e:
+        stop_event.set()
         update_job(jobs, job_id, "error", "Pipeline failed", 0, error=str(e))
         raise
 ```
 
-> **Trade-off:** Running everything in one Modal function means you lose granular progress updates (the frontend will see "Processing on cloud..." for the whole duration). This is acceptable for a hackathon demo. To add granular progress, you'd need a webhook or polling mechanism from Modal back to your server, which adds complexity.
+**Progress simulation:** The Modal call is a single blocking `.remote()` call. While it blocks, a background thread walks through the expected pipeline steps with timed increments. The frontend sees the progress bar advance through "Extracting audio..." → "Identifying speakers..." → etc. When Modal returns, the thread stops and progress jumps to 100%. The step durations are estimates — if the actual pipeline is faster or slower, the progress bar will either jump forward or pause at the last reached step. This is cosmetic, not functional, but it makes the UI/UX prize demo significantly more compelling.
 
 ---
 
@@ -923,21 +1128,22 @@ syncr/
 
 ## 8. `requirements.txt`
 
+**Local requirements** (what you `pip install` on your machine):
 ```
 fastapi>=0.104.0
 uvicorn>=0.24.0
+python-multipart>=0.0.9
 python-dotenv>=1.0.0
 aiohttp>=3.9.0
 aiofiles>=23.2.0
 openai>=1.6.0
 pydub>=0.25.1
 modal>=0.64.0
-pyannote.audio>=3.1.0
-torch>=2.1.0
-torchaudio>=2.1.0
 ```
 
-> **Note:** `pyannote.audio` and `torch` are only needed inside the Modal container (they're in the image definition). If you want a lighter local install, split into `requirements.txt` (local) and let the Modal image handle the heavy deps.
+> `python-multipart` is required by FastAPI for `UploadFile` handling. Without it, `POST /dub` silently fails.
+
+**Heavy deps** (`pyannote.audio`, `torch`, `torchaudio`) are NOT in local requirements — they're installed inside the Modal GPU image definition (see Section 4). This keeps local install fast and avoids GPU driver issues on dev machines.
 
 ---
 
