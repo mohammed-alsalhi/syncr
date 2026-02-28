@@ -142,6 +142,44 @@ Modal secrets: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=..
 - **Modal** for GPU container orchestration (`modal setup` + `modal token new`)
 - **faster-whisper** runs inside Modal containers only (not installed locally)
 
+## Debugging Workflow
+
+- **NEVER assume Modal container logs.** Always ask the user to paste Modal logs when debugging pipeline errors. The logs contain critical `[coordinator]`, `[synth]`, `[merge]`, and `[Demucs]` debug prints that are only visible in the Modal dashboard, not locally.
+- When a pipeline run fails or produces bad output, ask the user for:
+  1. The error message from the frontend/terminal
+  2. The relevant Modal logs (coordinator, process_chunk, synthesize_speaker, etc.)
+- Do not guess at what the logs say or what containers did — always ask.
+
+## Bug History & Fixes
+
+Tracking issues encountered during integration testing and their resolutions.
+
+### Fixed
+
+| # | Bug | Root Cause | Fix | Files |
+|---|-----|-----------|-----|-------|
+| 1 | `ModuleNotFoundError: No module named 'demucs.api'` | `demucs.api` only exists on GitHub main, not PyPI 4.0.1 | Changed `separate_audio()` to use CLI subprocess: `python -m demucs --two-stems=vocals` | `modal_jobs.py` |
+| 2 | Black screen + no audio output | Race condition: progress thread propagated `status: "done"` from Modal Dict before coordinator returned video bytes to orchestrator. Frontend saw "done", requested download, file didn't exist yet. | Progress thread never propagates "done" status from Modal, caps progress at 97% | `orchestrator.py` |
+| 3 | Arabic always dubs to Spanish | `target_language: str = "es"` was a query parameter, not a form field. Frontend sends it in FormData. | Changed to `target_language: str = Form("es")` | `main.py` |
+| 4 | `can't pickle multidict._multidict.CIMultiDictProxy` | aiohttp's `ClientResponseError` contains unpicklable headers; Modal can't serialize across containers | Replaced `resp.raise_for_status()` with explicit status checks raising `RuntimeError` | `modal_jobs.py` |
+| 5 | Volume inconsistency (dubbed voices too loud/quiet for scene) | ElevenLabs synthesizes at uniform level, but original audio varies by scene (close-up louder, distant quieter) | Per-segment volume matching: compare `dBFS` of original audio at that timestamp to dubbed clip, apply gain adjustment | `merge.py` |
+| 6 | HF_TOKEN warning in logs | Env vars set after pyannote imports; some huggingface_hub versions read token at import time | Added `use_auth_token=hf_token` to `Pipeline.from_pretrained` and `Inference` constructor | `diarize.py` |
+| 7 | Background audio muted / choppy transitions | merge.py was building from silence, discarding original audio | Implemented Demucs source separation: removes original voices, preserves music/effects/ambient as background track | `modal_jobs.py`, `modal_app.py`, `merge.py` |
+| 8 | 5 speakers detected instead of 3 (over-segmentation) | pyannote splits one real speaker into multiple labels | Added `_merge_similar_speakers()`: compares speaker embeddings within each chunk via cosine similarity (threshold 0.78), merges over-segmented speakers | `modal_jobs.py` |
+| 9 | Video black screen on playback | `-c:v copy` in merge.py produces codec-incompatible output; no `-movflags +faststart` | Re-encode to h264 (`libx264 -preset fast -crf 22`) + AAC audio + `-movflags +faststart` for progressive browser playback | `merge.py` |
+
+### In Progress
+
+| # | Bug | Status | Notes |
+|---|-----|--------|-------|
+| 10 | `ElevenLabs voice_too_short` (voice samples < 1 second) | Defense-in-depth fix deployed, awaiting test | Failed 3 times fixing in coordinator alone. Added validation inside `synthesize_speaker` itself: decodes sample with pydub, pads to 2s if < 1.5s, normalizes to mono 44.1kHz WAV. Need Modal logs to confirm fix works. |
+
+### Not Started
+
+| # | Bug | Status | Notes |
+|---|-----|--------|-------|
+| 11 | Voice mixing (wrong voice on wrong character sometimes) | Deferred | User wanted to test after voice_too_short fix. Three options proposed: (A) raise similarity threshold, (B) post-diarization verification pass, (C) gender-aware clustering. User has not chosen yet. |
+
 ## Migration Status
 
 Tracking the rebuild from simple sequential pipeline to movie-scale intelligent architecture.
@@ -152,4 +190,7 @@ Tracking the rebuild from simple sequential pipeline to movie-scale intelligent 
 - [x] Sprint 3: Quality feedback loop (verify + retry)
 - [x] Sprint 4: Speaker consistency across chunks (embeddings + matching)
 - [x] Sprint 5: Frontend pipeline dashboard + synced video player
-- [ ] Sprint 6: Integration testing + demo prep
+- [x] Sprint 6: Demucs source separation, speaker merging, h264 encoding, HF_TOKEN fix
+- [x] Sprint 7: Production bug fixes (race condition, Arabic language, pickle error, volume matching)
+- [ ] Sprint 8: Voice sample reliability (voice_too_short — defense-in-depth deployed, needs testing)
+- [ ] Sprint 9: Voice consistency improvements (pending user decision on approach)

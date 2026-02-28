@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import uvicorn
@@ -31,7 +31,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 async def create_dub_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    target_language: str = "es",  # default: Spanish
+    target_language: str = Form("es"),
 ):
     job_id = str(uuid.uuid4())
     input_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
