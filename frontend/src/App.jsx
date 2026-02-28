@@ -1,18 +1,18 @@
-import { useState, useRef, useEffect, useCallback } from "react"
+import { useState, useRef, useEffect, useCallback, useMemo } from "react"
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
 const LANGUAGES = [
-  { code: "es", label: "Spanish" },
-  { code: "fr", label: "French" },
-  { code: "de", label: "German" },
-  { code: "ar", label: "Arabic" },
-  { code: "zh", label: "Mandarin" },
-  { code: "ja", label: "Japanese" },
-  { code: "pt", label: "Portuguese" },
-  { code: "hi", label: "Hindi" },
-  { code: "ko", label: "Korean" },
-  { code: "it", label: "Italian" },
+  { code: "es", label: "Spanish", flag: "🇪🇸" },
+  { code: "fr", label: "French", flag: "🇫🇷" },
+  { code: "de", label: "German", flag: "🇩🇪" },
+  { code: "ar", label: "Arabic", flag: "🇸🇦" },
+  { code: "zh", label: "Mandarin", flag: "🇨🇳" },
+  { code: "ja", label: "Japanese", flag: "🇯🇵" },
+  { code: "pt", label: "Portuguese", flag: "🇧🇷" },
+  { code: "hi", label: "Hindi", flag: "🇮🇳" },
+  { code: "ko", label: "Korean", flag: "🇰🇷" },
+  { code: "it", label: "Italian", flag: "🇮🇹" },
 ]
 
 const PIPELINE_STEPS = [
@@ -26,6 +26,99 @@ const PIPELINE_STEPS = [
 ]
 
 const SPEAKER_COLORS = ["#818cf8", "#34d399", "#fb923c", "#f472b6", "#38bdf8", "#a78bfa", "#fbbf24"]
+
+// ─── Background Effects ────────────────────────────────────────────
+
+function AuroraBackground() {
+  return (
+    <div className="fixed inset-0 overflow-hidden pointer-events-none z-0">
+      <div className="absolute -top-1/2 -left-1/4 w-[800px] h-[800px] bg-violet-600/[0.15] rounded-full blur-[150px] animate-aurora-1" />
+      <div className="absolute -bottom-1/3 -right-1/4 w-[700px] h-[700px] bg-fuchsia-600/[0.12] rounded-full blur-[140px] animate-aurora-2" />
+      <div className="absolute top-1/4 left-1/3 w-[600px] h-[600px] bg-cyan-600/[0.08] rounded-full blur-[130px] animate-aurora-3" />
+    </div>
+  )
+}
+
+function FloatingParticles() {
+  const particles = useMemo(() =>
+    Array.from({ length: 30 }, (_, i) => ({
+      id: i,
+      left: Math.random() * 100,
+      delay: Math.random() * 25,
+      duration: 18 + Math.random() * 22,
+      size: 1 + Math.random() * 2.5,
+      opacity: 0.15 + Math.random() * 0.35,
+    })), [])
+
+  return (
+    <div className="fixed inset-0 pointer-events-none z-[1] overflow-hidden">
+      {particles.map(p => (
+        <div
+          key={p.id}
+          className="absolute rounded-full bg-violet-400"
+          style={{
+            left: `${p.left}%`,
+            bottom: '-10px',
+            width: `${p.size}px`,
+            height: `${p.size}px`,
+            opacity: p.opacity,
+            animation: `float ${p.duration}s linear ${p.delay}s infinite`,
+          }}
+        />
+      ))}
+    </div>
+  )
+}
+
+function MouseGlow() {
+  const [pos, setPos] = useState({ x: -500, y: -500 })
+
+  useEffect(() => {
+    const handler = (e) => setPos({ x: e.clientX, y: e.clientY })
+    window.addEventListener('mousemove', handler)
+    return () => window.removeEventListener('mousemove', handler)
+  }, [])
+
+  return (
+    <div
+      className="fixed w-[600px] h-[600px] rounded-full pointer-events-none z-[2]"
+      style={{
+        background: 'radial-gradient(circle, rgba(139, 92, 246, 0.07) 0%, rgba(217, 70, 239, 0.03) 40%, transparent 70%)',
+        transform: `translate(${pos.x - 300}px, ${pos.y - 300}px)`,
+        transition: 'transform 0.15s ease-out',
+      }}
+    />
+  )
+}
+
+function GridOverlay() {
+  return (
+    <div
+      className="fixed inset-0 pointer-events-none z-[1] opacity-[0.03]"
+      style={{
+        backgroundImage: `
+          linear-gradient(rgba(139, 92, 246, 0.5) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(139, 92, 246, 0.5) 1px, transparent 1px)
+        `,
+        backgroundSize: '60px 60px',
+      }}
+    />
+  )
+}
+
+// ─── Animated Border Wrapper ───────────────────────────────────────
+
+function AnimatedBorder({ children, innerClass = "", className = "" }) {
+  return (
+    <div className={`animated-border ${className}`}>
+      <div className={`card-inner ${innerClass}`}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────
 
 function getStepStatus(step, currentStep, progress) {
   const stepKeywords = {
@@ -50,6 +143,14 @@ function getStepStatus(step, currentStep, progress) {
   return "pending"
 }
 
+function formatTime(seconds) {
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${String(s).padStart(2, "0")}`
+}
+
+// ─── Icons ─────────────────────────────────────────────────────────
+
 function StepIcon({ icon, className = "" }) {
   const icons = {
     scissors: <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25l-2.5 2.5m0 0l-2.5-2.5M5 10.75v-8.5m7-1l2.5 2.5m0 0l2.5-2.5M14.5 3.75v8.5M3.5 16.5a2 2 0 104 0 2 2 0 00-4 0zm9 0a2 2 0 104 0 2 2 0 00-4 0z" />,
@@ -67,47 +168,67 @@ function StepIcon({ icon, className = "" }) {
   )
 }
 
-function PipelineNode({ step, status }) {
+// ─── Pipeline Components ───────────────────────────────────────────
+
+function PipelineNode({ step, status, index }) {
   return (
-    <div className={`flex flex-col items-center gap-1.5 px-2 min-w-[72px] transition-all duration-500
-      ${status === "active" ? "scale-110" : ""}
-    `}>
-      <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-500
-        ${status === "done" ? "bg-violet-500/30 text-violet-300 ring-1 ring-violet-500/50" : ""}
-        ${status === "active" ? "bg-violet-500/20 text-violet-300 ring-2 ring-violet-400 animate-glow" : ""}
-        ${status === "pending" ? "bg-white/5 text-white/20" : ""}
-      `}>
-        {status === "done" ? (
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4 text-violet-400">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
-          </svg>
-        ) : (
-          <StepIcon icon={step.icon} />
+    <div
+      className={`flex flex-col items-center gap-1.5 px-2 min-w-[72px] transition-all duration-500
+        ${status === "active" ? "scale-110" : ""}
+      `}
+      style={{
+        animation: 'stagger-in 0.5s ease-out backwards',
+        animationDelay: `${index * 80}ms`,
+      }}
+    >
+      <div className="relative">
+        {/* Pulse ring for active step */}
+        {status === "active" && (
+          <div className="absolute inset-0 rounded-xl bg-violet-500/30 animate-pulse-ring" />
         )}
+        <div className={`relative w-11 h-11 rounded-xl flex items-center justify-center transition-all duration-500
+          ${status === "done" ? "bg-violet-500/30 text-violet-300 ring-1 ring-violet-500/50 shadow-lg shadow-violet-500/20" : ""}
+          ${status === "active" ? "bg-violet-500/20 text-violet-200 ring-2 ring-violet-400 animate-glow" : ""}
+          ${status === "pending" ? "bg-white/[0.03] text-white/15" : ""}
+        `}>
+          {status === "done" ? (
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-4 h-4 text-violet-400">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+            </svg>
+          ) : (
+            <StepIcon icon={step.icon} />
+          )}
+        </div>
       </div>
-      <span className={`text-[10px] font-medium text-center leading-tight transition-colors
-        ${status === "done" ? "text-violet-300" : ""}
+      <span className={`text-[10px] font-semibold text-center leading-tight transition-colors tracking-wide uppercase
+        ${status === "done" ? "text-violet-400" : ""}
         ${status === "active" ? "text-white" : ""}
-        ${status === "pending" ? "text-white/25" : ""}
+        ${status === "pending" ? "text-white/20" : ""}
       `}>{step.label}</span>
     </div>
   )
 }
 
-function PipelineConnector({ done }) {
+function PipelineConnector({ done, active }) {
   return (
-    <div className={`h-0.5 w-6 flex-shrink-0 mt-[-18px] transition-all duration-700
-      ${done ? "bg-violet-500/60" : "bg-white/10"}
-    `} />
+    <div className="relative h-0.5 w-8 flex-shrink-0 mt-[-18px] overflow-hidden rounded-full">
+      <div className={`absolute inset-0 transition-all duration-700 ${done || active ? 'bg-violet-500/50' : 'bg-white/[0.06]'}`} />
+      {active && (
+        <div
+          className="absolute inset-0 w-1/3 bg-gradient-to-r from-transparent via-white/70 to-transparent rounded-full"
+          style={{ animation: 'beam 1.2s ease-in-out infinite' }}
+        />
+      )}
+    </div>
   )
 }
 
 function MetricPill({ label, value }) {
   if (value == null) return null
   return (
-    <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-xs font-mono animate-fade-in">
-      <span className="text-violet-400 font-semibold">{value}</span>
-      <span className="text-white/40">{label}</span>
+    <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white/[0.04] border border-white/[0.08] text-xs font-mono animate-fade-in animate-metric-glow backdrop-blur-sm">
+      <span className="text-violet-400 font-bold">{value}</span>
+      <span className="text-white/35">{label}</span>
     </div>
   )
 }
@@ -119,30 +240,32 @@ function TranscriptPanel({ segments }) {
   speakers.forEach((s, i) => { colorMap[s] = SPEAKER_COLORS[i % SPEAKER_COLORS.length] })
 
   return (
-    <div className="bg-white/[0.03] rounded-xl border border-white/10 p-4 max-h-64 overflow-y-auto">
-      <div className="text-xs font-semibold text-white/30 uppercase tracking-wider mb-3">Transcript</div>
-      <div className="space-y-2.5">
+    <AnimatedBorder innerClass="p-5 max-h-64 overflow-y-auto">
+      <div className="text-[10px] font-bold text-white/25 uppercase tracking-[0.2em] mb-3">Transcript</div>
+      <div className="space-y-3">
         {segments.map((seg, i) => (
-          <div key={i} className="animate-fade-in" style={{ animationDelay: `${i * 50}ms` }}>
+          <div
+            key={i}
+            style={{
+              animation: 'stagger-in 0.4s ease-out backwards',
+              animationDelay: `${i * 60}ms`,
+            }}
+          >
             <div className="flex items-center gap-2 mb-0.5">
-              <div className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: colorMap[seg.speaker] }} />
-              <span className="text-[10px] font-mono text-white/30" style={{ color: colorMap[seg.speaker] }}>{seg.speaker}</span>
-              <span className="text-[10px] text-white/20">{formatTime(seg.start)} - {formatTime(seg.end)}</span>
+              <div className="w-2 h-2 rounded-full flex-shrink-0 shadow-lg" style={{ backgroundColor: colorMap[seg.speaker], boxShadow: `0 0 8px ${colorMap[seg.speaker]}40` }} />
+              <span className="text-[10px] font-mono font-semibold" style={{ color: colorMap[seg.speaker] }}>{seg.speaker}</span>
+              <span className="text-[10px] text-white/15 font-mono">{formatTime(seg.start)} — {formatTime(seg.end)}</span>
             </div>
-            {seg.text && <p className="text-xs text-white/60 ml-4">{seg.text}</p>}
-            {seg.translated_text && <p className="text-xs text-violet-300/70 ml-4">→ {seg.translated_text}</p>}
+            {seg.text && <p className="text-xs text-white/50 ml-4 leading-relaxed">{seg.text}</p>}
+            {seg.translated_text && <p className="text-xs text-violet-300/60 ml-4 leading-relaxed">→ {seg.translated_text}</p>}
           </div>
         ))}
       </div>
-    </div>
+    </AnimatedBorder>
   )
 }
 
-function formatTime(seconds) {
-  const m = Math.floor(seconds / 60)
-  const s = Math.floor(seconds % 60)
-  return `${m}:${String(s).padStart(2, "0")}`
-}
+// ─── Synced Player ─────────────────────────────────────────────────
 
 function SyncedPlayer({ originalUrl, dubbedUrl, language }) {
   const origRef = useRef(null)
@@ -182,30 +305,41 @@ function SyncedPlayer({ originalUrl, dubbedUrl, language }) {
 
   return (
     <div className="space-y-4 animate-slide-up">
-      <div className="grid grid-cols-2 gap-3">
-        <div className="relative rounded-xl overflow-hidden bg-black border border-white/10">
-          <div className="absolute top-3 left-3 z-10 px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-sm text-xs font-medium text-white/70">Original</div>
-          <video ref={origRef} src={originalUrl} muted onTimeUpdate={handleTimeUpdate} onLoadedMetadata={() => setDuration(origRef.current?.duration || 0)} className="w-full" />
-        </div>
-        <div className="relative rounded-xl overflow-hidden bg-black border border-white/10">
-          <div className="absolute top-3 left-3 z-10 px-2.5 py-1 rounded-md bg-violet-600/80 backdrop-blur-sm text-xs font-medium">Dubbed — {langLabel}</div>
-          <video ref={dubRef} src={dubbedUrl} className="w-full" />
-        </div>
+      <div className="grid grid-cols-2 gap-4">
+        <AnimatedBorder innerClass="overflow-hidden">
+          <div className="relative">
+            <div className="absolute top-3 left-3 z-10 px-3 py-1 rounded-lg bg-black/60 backdrop-blur-md text-[11px] font-semibold text-white/70 border border-white/10">Original</div>
+            <video ref={origRef} src={originalUrl} muted onTimeUpdate={handleTimeUpdate} onLoadedMetadata={() => setDuration(origRef.current?.duration || 0)} className="w-full" />
+          </div>
+        </AnimatedBorder>
+        <AnimatedBorder innerClass="overflow-hidden">
+          <div className="relative">
+            <div className="absolute top-3 left-3 z-10 px-3 py-1 rounded-lg bg-gradient-to-r from-violet-600/80 to-fuchsia-600/80 backdrop-blur-md text-[11px] font-semibold border border-violet-400/20">
+              Dubbed — {langLabel}
+            </div>
+            <video ref={dubRef} src={dubbedUrl} className="w-full" />
+          </div>
+        </AnimatedBorder>
       </div>
       <div className="flex items-center gap-4">
-        <button onClick={isPlaying ? syncPause : syncPlay} className="w-10 h-10 rounded-full bg-violet-600 hover:bg-violet-500 flex items-center justify-center transition-colors flex-shrink-0">
+        <button
+          onClick={isPlaying ? syncPause : syncPlay}
+          className="w-11 h-11 rounded-full bg-gradient-to-br from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 flex items-center justify-center transition-all flex-shrink-0 shadow-lg shadow-violet-600/30 hover:shadow-violet-500/50 hover:scale-105 active:scale-95"
+        >
           {isPlaying ? (
             <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" className="w-4 h-4"><path d="M6 4h4v16H6zM14 4h4v16h-4z" /></svg>
           ) : (
             <svg xmlns="http://www.w3.org/2000/svg" fill="currentColor" viewBox="0 0 24 24" className="w-4 h-4 ml-0.5"><path d="M8 5v14l11-7z" /></svg>
           )}
         </button>
-        <input type="range" min={0} max={duration || 1} step={0.1} value={currentTime} onChange={handleScrub} className="flex-1 h-1 accent-violet-500" />
-        <span className="text-xs font-mono text-white/30 flex-shrink-0">{formatTime(currentTime)} / {formatTime(duration)}</span>
+        <input type="range" min={0} max={duration || 1} step={0.1} value={currentTime} onChange={handleScrub} className="flex-1 h-1" />
+        <span className="text-xs font-mono text-white/25 flex-shrink-0">{formatTime(currentTime)} / {formatTime(duration)}</span>
       </div>
     </div>
   )
 }
+
+// ─── Main App ──────────────────────────────────────────────────────
 
 export default function App() {
   const [file, setFile] = useState(null)
@@ -284,168 +418,256 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-white font-sans">
-      {/* Header */}
-      <header className="border-b border-white/10 px-8 py-5 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center text-sm font-bold">S</div>
-          <span className="text-xl font-semibold tracking-tight">Syncr</span>
-          <span className="text-xs text-white/30 font-mono ml-1">AI Dubbing Studio</span>
-        </div>
-        <a href="https://github.com" className="text-sm text-white/40 hover:text-white/70 transition-colors">GitHub</a>
-      </header>
+    <div className="min-h-screen bg-[#050508] text-white font-sans relative scanline-overlay">
+      {/* Background layers */}
+      <AuroraBackground />
+      <FloatingParticles />
+      <MouseGlow />
+      <GridOverlay />
 
-      <main className="max-w-5xl mx-auto px-6 py-16">
-        {/* Hero */}
-        <div className="text-center mb-14">
-          <h1 className="text-5xl font-bold tracking-tight mb-4 bg-gradient-to-r from-white to-white/50 bg-clip-text text-transparent">
-            Any voice. Any language.
-          </h1>
-          <p className="text-white/50 text-lg max-w-xl mx-auto">
-            Upload a video and every actor speaks your target language — in their own voice — powered by intelligent multi-container orchestration.
-          </p>
-        </div>
-
-        {/* Upload + Config */}
-        {!jobId && (
-          <div className="space-y-5 max-w-3xl mx-auto">
-            {/* Drop zone */}
+      {/* Content */}
+      <div className="relative z-10">
+        {/* Header */}
+        <header className="sticky top-0 z-50 border-b border-white/[0.06] px-8 py-4 flex items-center justify-between backdrop-blur-2xl bg-[#050508]/70">
+          <div className="flex items-center gap-3">
             <div
-              onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={handleDrop}
-              onClick={() => fileInputRef.current?.click()}
-              className={`relative border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all duration-300
-                ${isDragging ? "border-violet-400 bg-violet-500/10 scale-[1.02]" : "border-white/10 hover:border-white/25 hover:bg-white/[0.02]"}
-                ${file ? "border-violet-500/50 bg-violet-500/5" : ""}`}
+              className="w-9 h-9 bg-gradient-to-br from-violet-500 via-fuchsia-500 to-cyan-400 flex items-center justify-center text-sm font-black animate-logo-morph shadow-lg shadow-violet-500/30"
             >
-              <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={(e) => handleFile(e.target.files[0])} />
-              {file ? (
-                <div>
-                  <div className="text-4xl mb-3">🎬</div>
-                  <p className="font-medium">{file.name}</p>
-                  <p className="text-sm text-white/40 mt-1">{(file.size / 1e6).toFixed(1)} MB — click to change</p>
-                </div>
-              ) : (
-                <div>
-                  <div className="text-4xl mb-3">⬆️</div>
-                  <p className="font-medium">Drop a video file here</p>
-                  <p className="text-sm text-white/40 mt-1">MP4, MOV, AVI — clips to full movies</p>
-                </div>
-              )}
+              S
             </div>
+            <span className="text-xl font-bold tracking-tight">Syncr</span>
+            <span className="text-[10px] text-white/20 font-mono ml-1 tracking-wider uppercase">AI Dubbing Studio</span>
+          </div>
+          <a href="https://github.com" className="text-xs text-white/30 hover:text-white/60 transition-colors font-mono tracking-wide">GitHub</a>
+        </header>
 
-            {/* Language selector */}
-            <div className="flex gap-2.5 flex-wrap justify-center">
-              {LANGUAGES.map((lang) => (
-                <button
-                  key={lang.code}
-                  onClick={() => setLanguage(lang.code)}
-                  className={`px-4 py-2 rounded-full text-sm font-medium transition-all duration-200
-                    ${language === lang.code
-                      ? "bg-violet-500 text-white scale-105 shadow-lg shadow-violet-500/25"
-                      : "bg-white/5 text-white/50 hover:bg-white/10 hover:text-white hover:scale-105"
-                    }`}
-                >
-                  {lang.label}
-                </button>
-              ))}
-            </div>
-
-            {/* Start button */}
-            <button
-              onClick={startJob}
-              disabled={!file || isUploading}
-              className="w-full py-4 rounded-xl font-semibold text-lg
-                bg-gradient-to-r from-violet-600 to-fuchsia-600
-                hover:from-violet-500 hover:to-fuchsia-500
-                disabled:opacity-30 disabled:cursor-not-allowed
-                transition-all duration-200"
+        <main className="max-w-5xl mx-auto px-6 py-20">
+          {/* Hero */}
+          <div
+            className="text-center mb-16"
+            style={{ animation: 'fadeIn 0.8s ease-out, hero-glitch 10s linear 3s infinite' }}
+          >
+            <h1
+              className="text-6xl font-black tracking-tight mb-5 leading-[1.1]"
+              style={{
+                background: 'linear-gradient(90deg, #fff 0%, #c4b5fd 20%, #d946ef 40%, #06b6d4 60%, #c4b5fd 80%, #fff 100%)',
+                backgroundSize: '200% auto',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+                backgroundClip: 'text',
+                animation: 'text-shine 6s ease-in-out infinite',
+              }}
             >
-              {isUploading ? "Uploading..." : "Dub this video →"}
-            </button>
+              Any voice. Any language.
+            </h1>
+            <p className="text-white/40 text-lg max-w-2xl mx-auto leading-relaxed">
+              Upload a video and every actor speaks your target language — in their own cloned voice — powered by
+              <span className="text-violet-400/60"> intelligent multi-container GPU orchestration</span>.
+            </p>
           </div>
-        )}
 
-        {/* Pipeline Dashboard */}
-        {isRunning && (
-          <div className="space-y-6 animate-fade-in">
-            {/* Current step + progress */}
-            <div className="bg-white/5 rounded-2xl p-6 border border-white/10">
-              <div className="flex items-center justify-between mb-4">
-                <span className="font-semibold">{status?.step}</span>
-                <span className="text-white/40 font-mono text-sm">{status?.progress}%</span>
-              </div>
-              <div className="w-full bg-white/10 rounded-full h-1.5 mb-6">
-                <div
-                  className="bg-gradient-to-r from-violet-500 to-fuchsia-500 h-1.5 rounded-full transition-all duration-700"
-                  style={{ width: `${status?.progress}%` }}
-                />
-              </div>
-
-              {/* Pipeline step nodes */}
-              <div className="flex items-start justify-center gap-0 overflow-x-auto pb-2">
-                {PIPELINE_STEPS.map((step, i) => {
-                  const stepStatus = getStepStatus(step, status?.step, status?.progress || 0)
-                  return (
-                    <div key={step.key} className="flex items-start">
-                      {i > 0 && <PipelineConnector done={stepStatus === "done" || stepStatus === "active"} />}
-                      <PipelineNode step={step} status={stepStatus} />
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-
-            {/* Metrics */}
-            <div className="flex flex-wrap gap-2.5 justify-center">
-              <MetricPill label="chunks" value={status?.total_chunks && `${status?.completed_chunks || 0}/${status?.total_chunks}`} />
-              <MetricPill label="speakers" value={status?.speakers_found} />
-              <MetricPill label="segments" value={status?.segments_found} />
-              <MetricPill label="containers" value={status?.containers_total} />
-            </div>
-
-            {/* Transcript preview */}
-            <TranscriptPanel segments={status?.transcript_preview} />
-          </div>
-        )}
-
-        {/* Error */}
-        {isError && (
-          <div className="bg-red-500/10 border border-red-500/30 rounded-2xl p-6 animate-shake max-w-3xl mx-auto">
-            <p className="text-red-400 font-medium">Pipeline failed</p>
-            <p className="text-red-400/70 text-sm mt-1">{status?.error}</p>
-            <button onClick={reset} className="mt-4 text-sm text-white/50 hover:text-white">
-              ← Try again
-            </button>
-          </div>
-        )}
-
-        {/* Result — synced player */}
-        {isDone && originalUrl && dubbedUrl && (
-          <div className="space-y-6 animate-slide-up">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-semibold">Your dubbed video is ready</h2>
-              <a
-                href={dubbedUrl}
-                download="syncr_dubbed.mp4"
-                className="px-5 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-sm font-medium transition-colors"
+          {/* Upload + Config */}
+          {!jobId && (
+            <div className="space-y-6 max-w-3xl mx-auto animate-fade-in">
+              {/* Drop zone */}
+              <div
+                onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+                className={`relative rounded-2xl p-14 text-center cursor-pointer transition-all duration-500 border overflow-hidden group
+                  ${isDragging
+                    ? "border-violet-400/60 bg-violet-500/[0.12] scale-[1.02] shadow-[0_0_80px_rgba(139,92,246,0.25)]"
+                    : file
+                      ? "border-violet-500/30 bg-violet-500/[0.04]"
+                      : "border-white/[0.08] hover:border-violet-500/30 hover:bg-white/[0.02]"
+                  }
+                `}
+                style={file && !isDragging ? { animation: 'drop-glow 3s ease-in-out infinite' } : {}}
               >
-                Download
-              </a>
+                <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={(e) => handleFile(e.target.files[0])} />
+
+                {/* Ambient glow inside drop zone */}
+                <div className={`absolute inset-0 transition-opacity duration-500 ${isDragging ? 'opacity-100' : 'opacity-0'}`}>
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 bg-violet-500/20 rounded-full blur-[80px]" />
+                </div>
+
+                <div className="relative z-10">
+                  {file ? (
+                    <div>
+                      <div className="text-5xl mb-4">🎬</div>
+                      <p className="font-semibold text-lg">{file.name}</p>
+                      <p className="text-sm text-white/30 mt-1.5 font-mono">{(file.size / 1e6).toFixed(1)} MB — click to change</p>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className={`text-5xl mb-4 inline-block ${isDragging ? 'animate-upload-pulse' : 'group-hover:animate-upload-pulse'}`}>⬆️</div>
+                      <p className="font-semibold text-lg">Drop a video file here</p>
+                      <p className="text-sm text-white/25 mt-1.5">MP4, MOV, AVI — clips to full movies</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Language selector */}
+              <div className="flex gap-2.5 flex-wrap justify-center">
+                {LANGUAGES.map((lang, i) => (
+                  <button
+                    key={lang.code}
+                    onClick={() => setLanguage(lang.code)}
+                    className={`px-4 py-2 rounded-full text-sm font-medium transition-all duration-300
+                      ${language === lang.code
+                        ? "bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white scale-105 shadow-lg shadow-violet-500/30 ring-1 ring-violet-400/30"
+                        : "bg-white/[0.04] text-white/40 hover:bg-white/[0.08] hover:text-white/70 hover:scale-105 border border-white/[0.06] hover:border-violet-500/20"
+                      }`}
+                    style={{
+                      animation: 'stagger-in 0.4s ease-out backwards',
+                      animationDelay: `${i * 40}ms`,
+                    }}
+                  >
+                    <span className="mr-1.5">{lang.flag}</span>
+                    {lang.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Start button */}
+              <button
+                onClick={startJob}
+                disabled={!file || isUploading}
+                className="btn-shimmer w-full py-4 rounded-xl font-bold text-lg
+                  bg-gradient-to-r from-violet-600 via-fuchsia-600 to-violet-600 bg-[length:200%_100%]
+                  hover:shadow-[0_0_40px_rgba(139,92,246,0.3)] hover:scale-[1.015] active:scale-[0.985]
+                  disabled:opacity-20 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:shadow-none
+                  transition-all duration-300 shadow-lg shadow-violet-600/20"
+              >
+                {isUploading ? (
+                  <span className="flex items-center justify-center gap-3">
+                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
+                    Uploading...
+                  </span>
+                ) : (
+                  "Dub this video →"
+                )}
+              </button>
             </div>
+          )}
 
-            <SyncedPlayer originalUrl={originalUrl} dubbedUrl={dubbedUrl} language={language} />
+          {/* Pipeline Dashboard */}
+          {isRunning && (
+            <div className="space-y-6 animate-slide-up">
+              {/* Current step + progress */}
+              <AnimatedBorder innerClass="p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-2 h-2 rounded-full bg-violet-400 animate-pulse shadow-lg shadow-violet-400/50" />
+                    <span className="font-semibold text-sm">{status?.step}</span>
+                  </div>
+                  <span className="text-white/30 font-mono text-sm font-bold">{status?.progress}%</span>
+                </div>
 
-            {/* Final transcript */}
-            <TranscriptPanel segments={status?.transcript_preview} />
+                {/* Progress bar */}
+                <div className="w-full bg-white/[0.06] rounded-full h-2 mb-8 overflow-hidden">
+                  <div
+                    className="progress-bar bg-gradient-to-r from-violet-500 via-fuchsia-500 to-cyan-400 h-2 rounded-full transition-all duration-700 ease-out"
+                    style={{ width: `${status?.progress}%` }}
+                  />
+                </div>
 
-            <button onClick={reset} className="text-sm text-white/30 hover:text-white/60 transition-colors">
-              ← Dub another video
-            </button>
-          </div>
-        )}
-      </main>
+                {/* Pipeline step nodes */}
+                <div className="flex items-start justify-center gap-0 overflow-x-auto pb-2">
+                  {PIPELINE_STEPS.map((step, i) => {
+                    const stepStatus = getStepStatus(step, status?.step, status?.progress || 0)
+                    const nextStatus = i < PIPELINE_STEPS.length - 1
+                      ? getStepStatus(PIPELINE_STEPS[i + 1], status?.step, status?.progress || 0)
+                      : "pending"
+                    return (
+                      <div key={step.key} className="flex items-start">
+                        {i > 0 && (
+                          <PipelineConnector
+                            done={stepStatus === "done" || stepStatus === "active"}
+                            active={stepStatus === "active"}
+                          />
+                        )}
+                        <PipelineNode step={step} status={stepStatus} index={i} />
+                      </div>
+                    )
+                  })}
+                </div>
+              </AnimatedBorder>
+
+              {/* Metrics */}
+              <div className="flex flex-wrap gap-3 justify-center">
+                <MetricPill label="chunks" value={status?.total_chunks && `${status?.completed_chunks || 0}/${status?.total_chunks}`} />
+                <MetricPill label="speakers" value={status?.speakers_found} />
+                <MetricPill label="segments" value={status?.segments_found} />
+                <MetricPill label="containers" value={status?.containers_total} />
+              </div>
+
+              {/* Transcript preview */}
+              <TranscriptPanel segments={status?.transcript_preview} />
+            </div>
+          )}
+
+          {/* Error */}
+          {isError && (
+            <div className="animate-shake max-w-3xl mx-auto">
+              <AnimatedBorder innerClass="p-6">
+                <div className="flex items-start gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-red-500/20 flex items-center justify-center flex-shrink-0">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5 text-red-400">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+                    </svg>
+                  </div>
+                  <div>
+                    <p className="text-red-400 font-semibold">Pipeline failed</p>
+                    <p className="text-red-400/50 text-sm mt-1 font-mono">{status?.error}</p>
+                  </div>
+                </div>
+                <button onClick={reset} className="mt-5 text-sm text-white/30 hover:text-white/60 transition-colors font-medium">
+                  ← Try again
+                </button>
+              </AnimatedBorder>
+            </div>
+          )}
+
+          {/* Result — synced player */}
+          {isDone && originalUrl && dubbedUrl && (
+            <div className="space-y-6 animate-slide-up">
+              <div className="flex items-center justify-between">
+                <h2 className="text-2xl font-bold">
+                  <span
+                    style={{
+                      background: 'linear-gradient(90deg, #fff, #c4b5fd, #d946ef)',
+                      WebkitBackgroundClip: 'text',
+                      WebkitTextFillColor: 'transparent',
+                      backgroundClip: 'text',
+                    }}
+                  >
+                    Your dubbed video is ready
+                  </span>
+                </h2>
+                <a
+                  href={dubbedUrl}
+                  download="syncr_dubbed.mp4"
+                  className="btn-shimmer px-6 py-2.5 rounded-xl bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-sm font-semibold transition-all shadow-lg shadow-violet-600/20 hover:shadow-violet-500/40 hover:scale-105 active:scale-95"
+                >
+                  Download ↓
+                </a>
+              </div>
+
+              <SyncedPlayer originalUrl={originalUrl} dubbedUrl={dubbedUrl} language={language} />
+
+              {/* Final transcript */}
+              <TranscriptPanel segments={status?.transcript_preview} />
+
+              <button onClick={reset} className="text-sm text-white/25 hover:text-white/50 transition-all font-medium hover:translate-x-[-4px]">
+                ← Dub another video
+              </button>
+            </div>
+          )}
+        </main>
+      </div>
     </div>
   )
 }
