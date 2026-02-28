@@ -50,6 +50,90 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _merge_similar_speakers(segments: list[dict], threshold: float = 0.78) -> list[dict]:
+    """
+    Merge over-segmented speakers within a single chunk using embedding similarity.
+
+    Pyannote sometimes splits one real speaker into multiple labels (e.g. finding
+    5 speakers when there are only 3). This compares all speaker pairs via cosine
+    similarity on their embeddings and merges those above the threshold.
+
+    Uses a lower threshold than cross-chunk matching (0.78 vs 0.85) because
+    within-chunk embeddings come from identical audio conditions, so same-speaker
+    pairs have naturally higher similarity scores.
+
+    Args:
+        segments: List of segment dicts from diarize_speakers(), each with
+                  "speaker", "start", "end", "audio_path", "embedding" keys.
+        threshold: Cosine similarity threshold for merging (default 0.78).
+
+    Returns:
+        Same segments with speaker labels renumbered after merging.
+    """
+    if not segments:
+        return segments
+
+    # Collect representative embedding per local speaker (from longest segment)
+    speaker_embeddings: dict[str, list[float]] = {}
+    speaker_durations: dict[str, float] = {}
+    for seg in segments:
+        spk = seg["speaker"]
+        emb = seg.get("embedding", [])
+        dur = seg["end"] - seg["start"]
+        if emb and (spk not in speaker_embeddings or dur > speaker_durations.get(spk, 0)):
+            speaker_embeddings[spk] = emb
+            speaker_durations[spk] = dur
+
+    if len(speaker_embeddings) <= 1:
+        return segments  # Nothing to merge
+
+    # Greedy clustering: compare each speaker to existing clusters
+    clusters: list[dict] = []  # [{label, embedding, members: [local_speaker, ...]}]
+
+    for local_spk, emb in speaker_embeddings.items():
+        matched = False
+        for cluster in clusters:
+            sim = _cosine_similarity(emb, cluster["embedding"])
+            if sim > threshold:
+                cluster["members"].append(local_spk)
+                # Update cluster embedding as duration-weighted average
+                old_weight = cluster["total_duration"]
+                new_weight = speaker_durations[local_spk]
+                total = old_weight + new_weight
+                cluster["embedding"] = [
+                    (a * old_weight + b * new_weight) / total
+                    for a, b in zip(cluster["embedding"], emb)
+                ]
+                cluster["total_duration"] = total
+                matched = True
+                break
+        if not matched:
+            clusters.append({
+                "label": f"SPEAKER_{len(clusters):02d}",
+                "embedding": emb,
+                "members": [local_spk],
+                "total_duration": speaker_durations[local_spk],
+            })
+
+    # Build mapping: old speaker label → new merged label
+    speaker_map: dict[str, str] = {}
+    for cluster in clusters:
+        for member in cluster["members"]:
+            speaker_map[member] = cluster["label"]
+
+    # Relabel segments and update embeddings
+    for seg in segments:
+        old_spk = seg["speaker"]
+        seg["speaker"] = speaker_map.get(old_spk, old_spk)
+        # Update embedding to the cluster's merged embedding
+        for cluster in clusters:
+            if old_spk in cluster["members"]:
+                seg["embedding"] = cluster["embedding"]
+                break
+
+    return segments
+
+
 def _match_speakers_across_chunks(all_segments: list[dict], chunk_results: list[dict]) -> list[dict]:
     """
     Match speakers across chunks using embedding cosine similarity.
@@ -122,7 +206,7 @@ def _match_speakers_across_chunks(all_segments: list[dict], chunk_results: list[
 @app.function(
     image=cpu_image,
     timeout=300,
-    concurrency_limit=6,
+    max_containers=6,
     secrets=[modal.Secret.from_name("mimic-secrets")],
 )
 def synthesize_speaker(
@@ -139,6 +223,7 @@ def synthesize_speaker(
     """
     import asyncio
     import os
+    import io
     import aiohttp
 
     ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
@@ -146,13 +231,63 @@ def synthesize_speaker(
 
     async def _run():
         async with aiohttp.ClientSession() as session:
-            # Clone voice
             headers = {"xi-api-key": api_key}
+
+            # Pre-cleanup: delete cloned voices from PREVIOUS jobs only.
+            # Free tier allows only ~3 cloned voices. If a prior job crashed
+            # before cleanup, those voices are still on the account.
+            # Only delete voices whose name does NOT start with the current
+            # job_id — otherwise parallel containers would delete each other's voices.
+            try:
+                async with session.get(f"{ELEVENLABS_BASE}/voices", headers=headers) as resp:
+                    if resp.status == 200:
+                        voices_data = await resp.json()
+                        for v in voices_data.get("voices", []):
+                            if v.get("category") == "cloned" and not v.get("name", "").startswith(job_id):
+                                await session.delete(
+                                    f"{ELEVENLABS_BASE}/voices/{v['voice_id']}",
+                                    headers=headers,
+                                )
+            except Exception:
+                pass  # best-effort pre-cleanup
+
+            # Validate and fix voice sample before sending to ElevenLabs.
+            # Defense-in-depth: no matter what bytes arrive from the coordinator,
+            # ensure the sample meets ElevenLabs' minimum requirements.
+            from pydub import AudioSegment as _Seg
+            try:
+                sample_audio = _Seg.from_file(io.BytesIO(sample_bytes))
+                sample_dur = len(sample_audio)
+            except Exception:
+                sample_dur = 0
+                sample_audio = _Seg.silent(duration=0)
+
+            print(f"[synth] {speaker}: received {len(sample_bytes)} bytes, decoded {sample_dur}ms")
+
+            if sample_dur < 1500:
+                # Pad with silence to reach 2 seconds
+                pad_needed = 2000 - sample_dur
+                sample_audio = sample_audio + _Seg.silent(duration=pad_needed)
+                print(f"[synth] {speaker}: padded to {len(sample_audio)}ms")
+
+            # Re-export as mono WAV at 44.1kHz for consistency
+            sample_audio = sample_audio.set_channels(1).set_frame_rate(44100)
+            fixed_buf = io.BytesIO()
+            sample_audio.export(fixed_buf, format="wav")
+            fixed_bytes = fixed_buf.getvalue()
+            print(f"[synth] {speaker}: sending {len(fixed_bytes)} bytes ({len(sample_audio)}ms mono 44.1kHz)")
+
+            # Clone voice
             form = aiohttp.FormData()
             form.add_field("name", f"{job_id}_{speaker}")
-            form.add_field("files", sample_bytes, filename=f"{speaker}.wav", content_type="audio/wav")
+            form.add_field("files", fixed_bytes, filename=f"{speaker}.wav", content_type="audio/wav")
+
             async with session.post(f"{ELEVENLABS_BASE}/voices/add", headers=headers, data=form) as resp:
-                resp.raise_for_status()
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        f"ElevenLabs voice clone failed ({resp.status}): {body}"
+                    )
                 voice_id = (await resp.json())["voice_id"]
 
             # Synthesize all segments for this speaker
@@ -175,7 +310,11 @@ def synthesize_speaker(
                     f"{ELEVENLABS_BASE}/text-to-speech/{voice_id}",
                     headers=headers_tts, json=payload,
                 ) as resp:
-                    resp.raise_for_status()
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise RuntimeError(
+                            f"ElevenLabs TTS failed ({resp.status}): {body}"
+                        )
                     audio_bytes = await resp.read()
 
                 results.append({
@@ -187,9 +326,11 @@ def synthesize_speaker(
                 })
 
             # Cleanup: delete cloned voice (free tier has 3 voice limit)
-            async with session.delete(
-                f"{ELEVENLABS_BASE}/voices/{voice_id}", headers={"xi-api-key": api_key}
-            ) as resp:
+            try:
+                await session.delete(
+                    f"{ELEVENLABS_BASE}/voices/{voice_id}", headers=headers,
+                )
+            except Exception:
                 pass  # best-effort
 
             return results
@@ -203,7 +344,7 @@ def synthesize_speaker(
     image=whisper_image,
     gpu="T4",
     timeout=300,
-    concurrency_limit=4,
+    max_containers=4,
 )
 class WhisperTranscriber:
     """
@@ -241,7 +382,7 @@ class WhisperTranscriber:
     image=gpu_image,
     gpu="T4",
     timeout=600,
-    concurrency_limit=6,
+    max_containers=6,
     secrets=[modal.Secret.from_name("mimic-secrets")],
 )
 def process_chunk(
@@ -290,6 +431,11 @@ def process_chunk(
         )
         from pipeline.diarize import diarize_speakers
         segments = diarize_speakers(audio_path, tmpdir)
+
+        # Merge over-segmented speakers using embedding similarity.
+        # pyannote often splits one real speaker into multiple labels;
+        # this reduces e.g. 5 detected speakers to the actual 3.
+        segments = _merge_similar_speakers(segments)
         diarize_time = time.time() - t0
 
         _update_progress(
@@ -363,12 +509,63 @@ def process_chunk(
         }
 
 
+# ── Source separation (GPU, Demucs) ───────────────────────────────────────────
+
+@app.function(
+    image=gpu_image,
+    gpu="T4",
+    timeout=600,
+    max_containers=2,
+)
+def separate_audio(audio_bytes: bytes) -> bytes:
+    """
+    Separate vocals from accompaniment using Meta's Demucs (htdemucs model).
+
+    Takes the full original audio as bytes and returns only the accompaniment
+    (no_vocals) as WAV bytes. The accompaniment preserves background music,
+    sound effects, and ambient sound while removing the original speaker voices.
+
+    This runs on the FULL audio (not per-chunk) because Demucs produces
+    better separation with complete context.
+
+    Uses the demucs CLI via subprocess because demucs.api is not available
+    in the PyPI release (4.0.1) — it only exists on the unreleased GitHub main branch.
+    """
+    import tempfile
+    import subprocess
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.wav")
+        with open(input_path, "wb") as f:
+            f.write(audio_bytes)
+
+        output_dir = os.path.join(tmpdir, "separated")
+
+        # --two-stems=vocals: split into vocals + no_vocals (accompaniment)
+        # More efficient than full 4-stem separation — gives us exactly what we need.
+        subprocess.run([
+            "python", "-m", "demucs",
+            "--two-stems=vocals",
+            "-n", "htdemucs",
+            "-d", "cuda",
+            "-o", output_dir,
+            input_path,
+        ], check=True)
+
+        # Demucs outputs to: {output_dir}/htdemucs/{stem_name}/no_vocals.wav
+        accompaniment_path = os.path.join(output_dir, "htdemucs", "input", "no_vocals.wav")
+
+        with open(accompaniment_path, "rb") as f:
+            return f.read()
+
+
 # ── Level 1: Coordinator (CPU) ────────────────────────────────────────────────
 
 @app.function(
     image=cpu_image,
     timeout=900,
-    concurrency_limit=2,
+    max_containers=2,
     secrets=[modal.Secret.from_name("mimic-secrets")],
 )
 def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
@@ -381,6 +578,7 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
     """
     import tempfile
     import os
+    import io
     import time
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -389,8 +587,27 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
-        # ── Phase 1: Chunk the video ──
+        # ── Phase 1: Extract audio + chunk video + source separation (parallel) ──
         _update_progress(job_id, status="running", step="Analyzing video structure...", progress=2)
+
+        # Extract full-quality audio (44.1kHz stereo) for Demucs source separation.
+        # This is separate from the 16kHz mono extraction in process_chunk
+        # which is optimized for speech recognition.
+        import subprocess
+        full_audio_path = os.path.join(tmpdir, "full_audio.wav")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "44100",
+            full_audio_path,
+        ], check=True, capture_output=True)
+
+        with open(full_audio_path, "rb") as f:
+            full_audio_bytes = f.read()
+
+        # Spawn Demucs source separation in parallel with chunking.
+        # Demucs removes original voices, keeping only music/effects/ambient.
+        _update_progress(job_id, step="Separating background audio...", progress=3)
+        demucs_handle = separate_audio.spawn(full_audio_bytes)
 
         from pipeline.chunk import detect_scenes, split_video
         scenes = detect_scenes(input_path)
@@ -403,7 +620,7 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
             progress=5,
             total_chunks=total_chunks,
             completed_chunks=0,
-            containers_total=total_chunks,
+            containers_total=total_chunks + 1,  # +1 for Demucs container
         )
 
         # ── Phase 2: Dispatch chunks in parallel ──
@@ -451,11 +668,35 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
         for seg in all_segments:
             speakers.setdefault(seg["speaker"], []).append(seg)
 
-        # Find best voice sample per speaker (longest clip)
+        # Extract voice samples from the 44.1kHz WAV already extracted in Phase 1.
+        # ElevenLabs requires samples >= 1 second, so we concatenate segments
+        # from the same speaker until we reach at least 1.5 seconds.
+        from pydub import AudioSegment as _AudioSeg
+
+        original_audio = _AudioSeg.from_wav(full_audio_path)
+        print(f"[coordinator] Original audio loaded: {len(original_audio)}ms, "
+              f"{original_audio.channels}ch, {original_audio.frame_rate}Hz")
+
         speaker_samples: dict[str, bytes] = {}
         for spk, segs in speakers.items():
-            best = max(segs, key=lambda s: s["end"] - s["start"])
-            speaker_samples[spk] = best.get("audio_bytes", b"")
+            sorted_segs = sorted(segs, key=lambda s: s["end"] - s["start"], reverse=True)
+            clip = _AudioSeg.empty()
+            for s in sorted_segs:
+                start_ms = int(s["start"] * 1000)
+                end_ms = int(s["end"] * 1000)
+                seg_clip = original_audio[start_ms:end_ms]
+                print(f"[coordinator]   {spk} seg {s['start']:.1f}-{s['end']:.1f}s -> {len(seg_clip)}ms")
+                clip += seg_clip
+                if len(clip) >= 2000:  # 2s for generous margin
+                    break
+
+            # Write to a temp WAV file and read back (more reliable than BytesIO)
+            sample_path = os.path.join(tmpdir, f"voice_sample_{spk}.wav")
+            clip.export(sample_path, format="wav")
+            with open(sample_path, "rb") as f:
+                speaker_samples[spk] = f.read()
+            print(f"[coordinator] Voice sample for {spk}: {len(clip)}ms, "
+                  f"{len(speaker_samples[spk])} bytes, file={sample_path}")
 
         # ── Phase 4: Synthesize per speaker (parallel) ──
         _update_progress(
@@ -594,12 +835,23 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
             progress=85,
         )
 
-        # ── Phase 6: Merge chunks into final video ──
+        # ── Phase 6: Collect Demucs result + merge into final video ──
         _update_progress(
             job_id,
             step="Compositing final video...",
             progress=88,
         )
+
+        # Collect accompaniment from Demucs (spawned in Phase 1).
+        # If separation fails, merge falls back to ducking the original audio.
+        accompaniment_bytes = None
+        try:
+            accompaniment_bytes = demucs_handle.get()
+            print(f"[Demucs] Source separation complete — {len(accompaniment_bytes)} bytes")
+        except Exception as e:
+            print(f"[Demucs] Source separation failed, falling back to ducking: {e}")
+            # Fallback: merge.py will duck the original audio instead
+
         # Build chunk_results format expected by merge_chunks
         merge_input = []
         for cr in sorted(chunk_results, key=lambda c: c["chunk_idx"]):
@@ -617,7 +869,10 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
 
         from pipeline.merge import merge_chunks
         output_dir = os.path.join(tmpdir, "output")
-        output_path = merge_chunks(input_path, merge_input, job_id, output_dir)
+        output_path = merge_chunks(
+            input_path, merge_input, job_id, output_dir,
+            accompaniment_bytes=accompaniment_bytes,
+        )
 
         _update_progress(job_id, step="Done!", progress=100, status="done")
 

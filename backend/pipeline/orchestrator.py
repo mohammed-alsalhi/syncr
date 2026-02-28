@@ -32,11 +32,19 @@ def _poll_modal_progress(jobs: dict, job_id: str, stop_event: threading.Event):
         try:
             data = progress_dict.get(job_id)
             if data and isinstance(data, dict):
+                # Never propagate "done" status from Modal — only the
+                # orchestrator should set "done" after the output file is
+                # written to disk.  Otherwise the frontend requests the
+                # download before the file exists (race condition).
+                modal_status = data.get("status", "running")
+                if modal_status == "done":
+                    modal_status = "running"
+
                 _update_job(
                     jobs, job_id,
-                    status=data.get("status", "running"),
+                    status=modal_status,
                     step=data.get("step", "Processing..."),
-                    progress=data.get("progress", jobs[job_id].progress),
+                    progress=min(data.get("progress", jobs[job_id].progress), 97),
                     total_chunks=data.get("total_chunks"),
                     completed_chunks=data.get("completed_chunks"),
                     speakers_found=data.get("speakers_found"),
@@ -75,9 +83,10 @@ def run_pipeline(
         )
         progress_thread.start()
 
-        # Call Modal coordinator — blocks until full pipeline completes
-        from pipeline.modal_jobs import coordinator
-        output_bytes = coordinator.remote(video_bytes, target_language, job_id)
+        # Call the deployed Modal coordinator function
+        import modal
+        coordinator_fn = modal.Function.from_name("syncr", "coordinator")
+        output_bytes = coordinator_fn.remote(video_bytes, target_language, job_id)
 
         # Stop progress polling
         stop_event.set()
