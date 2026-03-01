@@ -940,6 +940,8 @@ def web():
         allow_origins=[
             "https://synr.tech",
             "https://www.synr.tech",
+            "https://syncr.tech",
+            "https://www.syncr.tech",
             "http://localhost:5173",
         ],
         allow_methods=["*"],
