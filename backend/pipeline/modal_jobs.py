@@ -918,9 +918,9 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
     image=web_image,
     volumes={"/data": volume},
     timeout=60,
-    allow_concurrent_inputs=100,
-    container_idle_timeout=300,
+    scaledown_window=300,
 )
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def web():
     """
@@ -957,7 +957,6 @@ def web():
         # Initialize progress in modal.Dict
         _update_progress(
             job_id,
-            job_id=job_id,
             status="queued",
             step="Waiting to start",
             progress=0,
@@ -972,7 +971,7 @@ def web():
     async def get_status(job_id: str):
         try:
             progress_dict = _get_progress_dict()
-            data = progress_dict.get(job_id)
+            data = await progress_dict.get.aio(job_id)
             if data and isinstance(data, dict):
                 data.setdefault("job_id", job_id)
                 if data.get("status") == "done":

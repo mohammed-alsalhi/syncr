@@ -36,6 +36,7 @@ web_image = (
         "fastapi",
         "python-multipart",
     )
+    .add_local_python_source("pipeline")
 )
 
 # GPU image — heavy, used by process_chunk containers (diarization needs GPU)
