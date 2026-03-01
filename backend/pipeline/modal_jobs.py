@@ -736,104 +736,18 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
                     "dubbed_audio_path": dub_path,
                 })
 
-        # ── Phase 5: Quality verification + retry loop ──
+        # ── Phase 5: Log synthesis results ──
+        # Quality retry loop removed: it created new voice clones per retry,
+        # causing voice inconsistency (same character sounding different across
+        # segments). Timing mismatches are handled by merge.py's atempo speedup.
         _update_progress(
             job_id,
-            step="Verifying synthesis quality...",
-            progress=80,
+            step=f"Synthesis complete: {len(synthesized_segments)} segment(s)",
+            progress=85,
             containers_active=0,
         )
-
-        from pipeline.quality import verify_segments, build_strict_retranslation_prompt
-        from pipeline.translate import LANGUAGE_NAMES
-
-        MAX_RETRIES = 2
-        lang_name = LANGUAGE_NAMES.get(target_language, target_language)
-
-        for retry_round in range(MAX_RETRIES):
-            passed, failed = verify_segments(synthesized_segments)
-
-            if not failed:
-                break
-
-            _update_progress(
-                job_id,
-                step=f"Re-processing {len(failed)} segment(s) (round {retry_round + 1})...",
-                progress=82 + retry_round,
-            )
-
-            # Re-translate failed segments with stricter constraints
-            from openai import OpenAI
-            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-            for seg in failed:
-                # Look up original source text from all_segments for re-translation
-                original_text = seg.get("translated_text", "")
-                # Find the matching original segment to get source language text
-                for orig in all_segments:
-                    if orig["speaker"] == seg["speaker"] and abs(orig["start"] - seg["start"]) < 0.01:
-                        original_text = orig.get("text", original_text)
-                        break
-                if not original_text:
-                    continue
-
-                prompt = build_strict_retranslation_prompt(seg, lang_name)
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": original_text},
-                    ],
-                    max_tokens=300,
-                    temperature=0.2,
-                )
-                seg["translated_text"] = response.choices[0].message.content.strip()
-
-            # Re-synthesize failed segments
-            # Group by speaker, reuse existing voice samples
-            failed_by_speaker: dict[str, list[dict]] = {}
-            for seg in failed:
-                failed_by_speaker.setdefault(seg["speaker"], []).append(seg)
-
-            retry_handles = []
-            for spk, segs in failed_by_speaker.items():
-                clean_segs = [
-                    {k: v for k, v in s.items() if k not in ("audio_bytes", "dubbed_audio_path", "failure_reason")}
-                    for s in segs
-                ]
-                sample = speaker_samples.get(spk, b"")
-                retry_handles.append(synthesize_speaker.spawn(spk, clean_segs, sample, job_id))
-
-            # Collect retry results and update synthesized_segments
-            retry_results = []
-            for handle in retry_handles:
-                speaker_results = handle.get()
-                for i, seg in enumerate(speaker_results):
-                    dub_path = os.path.join(dub_dir, f"retry_{seg['speaker']}_{retry_round}_{i:04d}.mp3")
-                    with open(dub_path, "wb") as f:
-                        f.write(seg["dubbed_audio_bytes"])
-                    retry_results.append({
-                        "speaker": seg["speaker"],
-                        "start": seg["start"],
-                        "end": seg["end"],
-                        "translated_text": seg.get("translated_text", ""),
-                        "dubbed_audio_path": dub_path,
-                    })
-
-            # Replace failed segments with retry results
-            failed_keys = {(s["speaker"], s["start"]) for s in failed}
-            synthesized_segments = [
-                s for s in synthesized_segments
-                if (s["speaker"], s["start"]) not in failed_keys
-            ] + retry_results
-
-        # Final verification for logging
-        final_passed, final_failed = verify_segments(synthesized_segments)
-        _update_progress(
-            job_id,
-            step=f"Quality check: {len(final_passed)}/{len(final_passed) + len(final_failed)} passed",
-            progress=85,
-        )
+        print(f"[coordinator] Synthesized {len(synthesized_segments)} segments "
+              f"for {len(speakers)} speaker(s), language={target_language}")
 
         # ── Phase 6: Collect Demucs result + merge into final video ──
         _update_progress(

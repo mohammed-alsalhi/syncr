@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Syncr (Mimic) is an AI dubbing studio built for HackIllinois 2026. Upload a video — even a full-length movie — and every actor speaks a target language in their own cloned voice with timing-aware pacing. Full-stack app: React/Vite frontend + FastAPI/Python backend, orchestrated via Modal for GPU-parallel processing.
 
-The system scales to feature-length content via intelligent scene-aware chunking, parallel multi-container processing, self-hosted GPU inference (Whisper), and a self-healing quality feedback loop.
+The system scales to feature-length content via intelligent scene-aware chunking, parallel multi-container processing, self-hosted GPU inference (Whisper), and Demucs source separation for clean background audio.
 
 ## Repository Structure
 
@@ -25,10 +25,10 @@ syncr/
 │       ├── extract.py          # Step 1: ffmpeg audio extraction
 │       ├── diarize.py          # Step 2: pyannote speaker diarization (GPU) + speaker embeddings
 │       ├── transcribe.py       # Local-only Whisper fallback (pipeline uses self-hosted WhisperTranscriber on Modal)
-│       ├── translate.py        # Step 4: GPT-4o-mini context-aware translation
+│       ├── translate.py        # Step 4: GPT-4o context-aware translation (upgraded from 4o-mini)
 │       ├── synthesize.py       # Step 5: ElevenLabs voice cloning + TTS (local fallback)
-│       ├── quality.py          # Quality verification + retry loop for synthesized segments
-│       ├── merge.py            # Chunk merging + final video composite
+│       ├── quality.py          # Quality verification (retry loop removed — caused voice inconsistency)
+│       ├── merge.py            # Chunk merging + final video composite (Demucs center-trim, crossfades, volume matching)
 │       └── composite.py        # Per-chunk ffmpeg video composition (building block used by merge.py)
 ├── frontend/
 │   ├── index.html
@@ -55,18 +55,24 @@ syncr/
 Local FastAPI                     Modal Cloud
 ─────────────                     ───────────────────────────────────────────
 POST /dub ──→ orchestrator.py ──→ Level 1: coordinator (CPU)
-              polls modal.Dict       │  chunks video via scene detection
-              for real progress      │  spawns process_chunk per chunk
-                                     │  matches speakers across chunks
+              polls modal.Dict       │  extracts 44.1kHz audio for Demucs
+              for real progress      │  spawns separate_audio (Demucs) in parallel
+                                     │  chunks video via scene detection
+                                     │  spawns process_chunk per chunk
+                                     │  matches speakers across chunks (embeddings)
                                      │  dispatches synthesis per global speaker
-                                     │  runs quality verification + retries
-                                     │  merges chunks into final video
+                                     │  center-trims Demucs output, merges final video
                                      │
                                      ├──→ Level 2: process_chunk (T4 GPU) × N chunks
-                                     │       extract audio (ffmpeg)
+                                     │       extract audio (ffmpeg, 16kHz mono)
                                      │       diarize speakers (pyannote + embeddings)
+                                     │       merge over-segmented speakers (cosine sim)
                                      │       transcribe (WhisperTranscriber.map())
-                                     │       translate (GPT-4o-mini, context-aware)
+                                     │       translate (GPT-4o, context-aware)
+                                     │
+                                     ├──→ Level 2: separate_audio (T4 GPU) × 1
+                                     │       Demucs htdemucs source separation
+                                     │       removes vocals, keeps accompaniment
                                      │
                                      ├──→ Level 2: WhisperTranscriber (T4 GPU) × up to 4
                                      │       self-hosted faster-whisper "medium"
@@ -74,6 +80,7 @@ POST /dub ──→ orchestrator.py ──→ Level 1: coordinator (CPU)
                                      │       parallel segment transcription via .map()
                                      │
                                      └──→ Level 3: synthesize_speaker (CPU) × N speakers
+                                             defense-in-depth sample validation
                                              clone voice via ElevenLabs
                                              synthesize all segments for that speaker
                                              delete cloned voice after completion
@@ -106,20 +113,22 @@ npm install
 npm run dev                        # http://localhost:5173
 ```
 
-### Test pipeline on Modal
+### Deploy to Modal
 ```bash
 cd backend
-modal run pipeline/modal_jobs.py
+modal deploy pipeline/modal_jobs.py
 ```
 
 ## Environment Variables
 
 Required in `backend/.env` (copy from `backend/.env.example`):
-- `OPENAI_API_KEY` — GPT-4o-mini translation (Whisper transcription now self-hosted on Modal)
-- `ELEVENLABS_API_KEY` — voice cloning and TTS
+- `OPENAI_API_KEY` — GPT-4o translation (Whisper transcription now self-hosted on Modal)
+- `ELEVENLABS_API_KEY` — voice cloning and TTS (requires paid plan with instant voice cloning)
 - `HF_TOKEN` — HuggingFace (pyannote model access)
 
 Modal secrets: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=... ELEVENLABS_API_KEY=...`
+
+**Note:** `modal secret create --force` replaces the ENTIRE secret. Include all three keys every time.
 
 ## Key Conventions
 
@@ -129,10 +138,15 @@ Modal secrets: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=..
 - **Bytes over paths for cross-container data** — all containers receive/return audio as bytes since they have separate filesystems
 - **Self-hosted Whisper** — faster-whisper "medium" on T4 GPU via `@app.cls` with `@modal.enter()` for model caching
 - **Speaker consistency** — pyannote speaker embeddings compared across chunks via cosine similarity to assign global speaker IDs
-- **Quality feedback loop** — after synthesis, verify timing/overlap/silence, re-translate and re-synthesize failed segments (max 2 retries)
-- **Context-aware translation** — GPT prompt includes segment duration + surrounding dialogue context for natural phrasing
+- **Within-chunk speaker merging** — `_merge_similar_speakers()` reduces pyannote over-segmentation (threshold 0.78)
+- **Context-aware translation** — GPT-4o prompt includes segment duration + surrounding dialogue context for natural phrasing
+- **Demucs source separation** — removes original voices, preserves music/effects/ambient; center-trimmed to fix padding offset
+- **30ms crossfades** — fade-in/fade-out on every dubbed segment to eliminate hard pops at boundaries
+- **Volume matching** — each dubbed segment's dBFS matched to the original audio at that timestamp
+- **Defense-in-depth voice validation** — `synthesize_speaker` validates/pads samples before sending to ElevenLabs (min 1.5s → pad to 2s)
+- **No quality retry loop** — removed because it created new voice clones per retry, causing voice inconsistency. Timing handled by merge.py atempo.
 - **Real progress tracking** — `modal.Dict` written by all containers, polled by local orchestrator every 1s
-- **Voice cleanup** — delete ElevenLabs cloned voices after each job (free tier: 3 voice limit)
+- **Voice cleanup** — delete ElevenLabs cloned voices after each job + pre-cleanup of stale voices from previous jobs
 - **Frontend env** — API URL via `import.meta.env.VITE_API_URL`, defaults to `http://localhost:8000`
 
 ## External Dependencies
@@ -141,6 +155,7 @@ Modal secrets: `modal secret create mimic-secrets HF_TOKEN=... OPENAI_API_KEY=..
 - **HuggingFace model access** required: accept terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`
 - **Modal** for GPU container orchestration (`modal setup` + `modal token new`)
 - **faster-whisper** runs inside Modal containers only (not installed locally)
+- **ElevenLabs** paid plan required for instant voice cloning (free tier doesn't include it)
 
 ## Debugging Workflow
 
@@ -167,18 +182,16 @@ Tracking issues encountered during integration testing and their resolutions.
 | 7 | Background audio muted / choppy transitions | merge.py was building from silence, discarding original audio | Implemented Demucs source separation: removes original voices, preserves music/effects/ambient as background track | `modal_jobs.py`, `modal_app.py`, `merge.py` |
 | 8 | 5 speakers detected instead of 3 (over-segmentation) | pyannote splits one real speaker into multiple labels | Added `_merge_similar_speakers()`: compares speaker embeddings within each chunk via cosine similarity (threshold 0.78), merges over-segmented speakers | `modal_jobs.py` |
 | 9 | Video black screen on playback | `-c:v copy` in merge.py produces codec-incompatible output; no `-movflags +faststart` | Re-encode to h264 (`libx264 -preset fast -crf 22`) + AAC audio + `-movflags +faststart` for progressive browser playback | `merge.py` |
+| 10 | `ElevenLabs voice_too_short` (voice samples < 1 second) | Short segments produced samples under ElevenLabs' 1s minimum | Defense-in-depth: `synthesize_speaker` decodes sample with pydub, pads to 2s if < 1.5s, normalizes to mono 44.1kHz WAV. Confirmed working in logs (SPEAKER_02: 912ms → padded to 2000ms). | `modal_jobs.py` |
+| 11 | Voice inconsistency + choppy audio | Quality retry loop (Phase 5) created 3 separate voice clones per speaker across retries — each sounded different. 14 segments with hard starts/stops. | Removed retry loop (merge.py atempo handles timing). Added 30ms fade-in/fade-out crossfades. | `modal_jobs.py`, `merge.py` |
+| 12 | Dubbed video ~1s behind original (audio/video desync) | Demucs adds symmetric padding to its output. `bg[:total_duration_ms]` trimmed only from end, keeping start padding. | Center-trim: remove equal padding from both start and end of Demucs accompaniment | `merge.py` |
+| 13 | `ElevenLabs voice_add_edit_limit_reached` (monthly quota) | Free tier has 95 voice add/edit operations per month; exhausted by testing iterations | User created new ElevenLabs account with paid plan (instant voice cloning required) | Config only |
 
 ### In Progress
 
 | # | Bug | Status | Notes |
 |---|-----|--------|-------|
-| 10 | `ElevenLabs voice_too_short` (voice samples < 1 second) | Defense-in-depth fix deployed, awaiting test | Failed 3 times fixing in coordinator alone. Added validation inside `synthesize_speaker` itself: decodes sample with pydub, pads to 2s if < 1.5s, normalizes to mono 44.1kHz WAV. Need Modal logs to confirm fix works. |
-
-### Not Started
-
-| # | Bug | Status | Notes |
-|---|-----|--------|-------|
-| 11 | Voice mixing (wrong voice on wrong character sometimes) | Deferred | User wanted to test after voice_too_short fix. Three options proposed: (A) raise similarity threshold, (B) post-diarization verification pass, (C) gender-aware clustering. User has not chosen yet. |
+| 14 | Voice mixing (wrong voice on wrong character sometimes) | Awaiting test | Previously caused partly by retry loop (3 different clones per speaker). Now with single clone per speaker, need to test if issue persists. If so, options: (A) raise similarity threshold, (B) post-diarization verification pass, (C) gender-aware clustering. |
 
 ## Migration Status
 
@@ -192,5 +205,7 @@ Tracking the rebuild from simple sequential pipeline to movie-scale intelligent 
 - [x] Sprint 5: Frontend pipeline dashboard + synced video player
 - [x] Sprint 6: Demucs source separation, speaker merging, h264 encoding, HF_TOKEN fix
 - [x] Sprint 7: Production bug fixes (race condition, Arabic language, pickle error, volume matching)
-- [ ] Sprint 8: Voice sample reliability (voice_too_short — defense-in-depth deployed, needs testing)
-- [ ] Sprint 9: Voice consistency improvements (pending user decision on approach)
+- [x] Sprint 8: Voice sample reliability (voice_too_short defense-in-depth fix)
+- [x] Sprint 9: Remove retry loop, add crossfades (voice consistency + smoothness)
+- [x] Sprint 10: Demucs center-trim (audio sync fix), GPT-4o translation upgrade
+- [ ] Sprint 11: Voice mixing improvements (pending test results)

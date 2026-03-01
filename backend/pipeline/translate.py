@@ -41,7 +41,7 @@ def translate_segments(segments: list[dict], target_language: str) -> list[dict]
         duration = seg["end"] - seg["start"]
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {
                     "role": "system",
@@ -109,7 +109,7 @@ def translate_segments_with_context(segments: list[dict], target_language: str) 
         dialogue_block = "\n".join(dialogue_lines)
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {
                     "role": "system",
