@@ -6,14 +6,14 @@
 
 ## Design Philosophy
 
-**"Matrix Terminal meets AI Cinema"** — the UI should feel like a professional AI control room where every element has purpose. Dark, cinematic, and alive with subtle motion. The vibe: a hacker's dubbing studio from the future.
+**"Clean Dark Studio"** — the UI is a minimal, dark-themed control panel focused on clarity and function. No background effects, no visual noise — just content, data, and clean transitions. The vibe: a professional dubbing console that gets out of the way.
 
 ### Principles
-1. **No dead space** — every pixel either shows data, sets atmosphere, or guides the user.
-2. **Layered depth** — background effects (aurora, matrix rain, geometry) recede behind glassy foreground cards.
+1. **Content first** — every element shows data or guides the user. No decorative layers.
+2. **Single accent color** — green (`#62DE61`) is the only color. Everything else is white at varying opacities on pure black.
 3. **Progressive reveal** — boot sequence → hero landing → upload flow → pipeline dashboard → result player. Each phase earns the next.
 4. **Zero scroll on landing** — the entire upload experience lives in one viewport frame (laptop/PC). Pipeline and result views allow internal scroll within a fixed-height container.
-5. **Subtle > flashy** — animations enhance without distracting. Rain is atmospheric, not aggressive.
+5. **Subtle > flashy** — animations are functional (fade-in, slide-up, pulse) not decorative.
 
 ---
 
@@ -22,20 +22,25 @@
 ### Colors
 | Token | Value | Usage |
 |-------|-------|-------|
-| Background | `#020408` | Body base |
-| Card surface | `rgba(5,5,12,0.75)` | Dropzone, glassmorphism cards |
-| Emerald primary | `#10b981` | Accents, glows, selected states |
-| Emerald light | `#34d399` / `#4ade80` | Highlights, decode-active text |
-| Cyan accent | `#06b6d4` / `#22d3ee` | Secondary glow, chromatic aberration |
-| Violet accent | `rgba(167,139,250,…)` | Matrix rain tertiary color mode |
-| Text primary | `#f0fdf4` | Headings, body copy |
-| Text muted | `rgba(255,255,255,0.45)` | Labels, subtitles |
+| Background | `#000000` | Body base (pure black) |
+| Green (primary accent) | `#62DE61` | Buttons, progress bars, active states, icons, highlights, "S" logo, slider thumbs, text selection |
+| Header surface | `rgba(0,0,0,0.92)` | Sticky header with backdrop blur |
+| Card surface | `rgba(255,255,255,0.02)` | Dropzone, stat pills, pipeline cards, transcript panel |
+| Card border | `rgba(255,255,255,0.07–0.08)` | Subtle borders on all cards/surfaces |
+| Text primary | `rgba(255,255,255,0.85)` | Headings, selected language labels |
+| Text secondary | `rgba(255,255,255,0.40–0.55)` | Body copy, descriptions |
+| Text muted | `rgba(255,255,255,0.20–0.30)` | Labels, timestamps, subtitles |
+| Text faint | `rgba(255,255,255,0.15–0.06)` | Separators, disabled states, scrollbar |
+| Error red | `#f87171` / `rgba(239,68,68,…)` | Error state text, icons, card borders |
+| Speaker colors | `#62DE61`, `#60a5fa`, `#f472b6`, `#fb923c`, `#a78bfa`, `#34d399`, `#fbbf24` | Per-speaker transcript coloring (green, blue, pink, orange, purple, teal, amber) |
 
 ### Fonts
-| Family | Weight | Usage |
-|--------|--------|-------|
-| Space Grotesk | 300–700 | Body, UI labels, buttons |
-| JetBrains Mono | 400–700 | Titles (MatrixDecodeTitle), code, terminal output |
+| Family | Tailwind Class | Weight | Usage |
+|--------|---------------|--------|-------|
+| Space Grotesk | `font-sans` (default) | 300–700 | Body text, headings, buttons, UI labels. Set globally on `<body>` with `-0.01em` letter-spacing. |
+| JetBrains Mono | `font-mono` | 400–700 | Stats, metric pills, "AI Dubbing Studio" subtitle, timestamps, file sizes, pipeline labels, terminal boot text, "GPU Ready" indicator. |
+
+Both loaded as web fonts with system fallbacks (`system-ui, sans-serif` and `ui-monospace, monospace`).
 
 ---
 
@@ -44,16 +49,17 @@
 ### Viewport Strategy
 ```
 ┌─────────────────────────────────────────┐  ← 100vh
-│  <nav> (fixed ~57px)                    │
+│  <header> (sticky, 56px)                │
+│  backdrop-blur-xl, rgba(0,0,0,0.92)     │
 ├─────────────────────────────────────────┤
-│  <main> height: calc(100vh - 57px)      │
-│  flex flex-col                          │
+│  <main> height: calc(100vh - 56px)      │
+│  max-w-6xl mx-auto, flex flex-col       │
 │                                         │
 │  LANDING (grid grid-cols-[1fr,1fr])     │
 │  ┌──────────────┬──────────────────┐    │
 │  │  Hero / Left │  Upload / Right  │    │
 │  │  - Eyebrow   │  - Dropzone      │    │
-│  │  - Title     │  - Languages     │    │
+│  │  - Title     │  - Language grid  │    │
 │  │  - Subtitle  │  - Start btn     │    │
 │  │  - Stats     │                  │    │
 │  └──────────────┴──────────────────┘    │
@@ -70,41 +76,55 @@
 
 ## Component Inventory
 
-### Background Layer (`z-0` to `z-10`)
+### Boot & Utility Components
 
 | Component | Description |
 |-----------|-------------|
-| `MatrixRain` | Canvas-based katakana/symbol column rain. Uses `requestAnimationFrame`. Three color modes per column: emerald, cyan, violet. Head has subtle glow via `ctx.shadowBlur`. Trail fades fast (alpha 0.12) to keep it atmospheric, not dominant. |
-| `AuroraBackground` | Three large radial blobs animated with `aurora1/2/3` keyframes (20–26s, ease-in-out). Emerald + cyan color stops. Absolute positioned, `blur-3xl`, `opacity-30`. |
-| `PerspectiveGrid` | Static SVG vanishing-point grid, `opacity-[0.035]`. Adds depth to the dark background. |
-| `FloatingGeometry` | Scattered SVG shapes (circles, rectangles, triangles) drifting slowly. `opacity-[0.04]`. Pure atmosphere. |
-| `FloatingParticles` | 18 tiny white dots floating upward with `float` keyframe animation. Staggered delays, vary in size. |
-| `MouseGlow` | Tracks cursor position via `mousemove`. Renders a 700px radial gradient orb that follows the mouse. `opacity-[0.08]`. |
-| `ScanlineOverlay` | Fixed div with `repeating-linear-gradient` CRT horizontal scan effect. `opacity-[0.025]`, `z-[101]`. |
+| `BootSequence` | Terminal-style cold boot overlay. Renders on first mount, types `BOOT_LINES` (system status messages) at 130ms/line on a dark card with `rgba(255,255,255,0.03)` background. Phases: `"booting"` (typing with blinking cursor) → `"fading"` (opacity transition out, 0.8s) → `"done"` (unmounts). Total duration ~2.2s. |
+| `TypewriterText` | Types characters one-by-one at 22ms/char with blinking cursor. Used for the pipeline step label during processing. Resets and re-types when text prop changes. |
+| `WaveformBars` | 36 animated bars with `wave-bar` keyframe + staggered delays. Bars have sinusoidal base heights for visual variety. Active state uses green, inactive uses `rgba(255,255,255,0.06)`. Displayed at the bottom of the pipeline card. |
 
-### Foreground Components
-
-| Component | Props | Description |
-|-----------|-------|-------------|
-| `MatrixDecodeTitle` | `lines: [{text, gradient?}]`, `className` | Char-by-char matrix decode → final gradient text. Chars cycle through `DECODE_CHARS` (katakana + symbols) at 45ms, stagger by 72ms per char position. Three phases per char: `idle` (dim), `active` (bright green), `locked` (gradient shine). Uses `lockCountRef` to avoid spurious re-renders. |
-| `ChromaticText` | `children`, `className` | Text with R/B channel shift layers via `::before`/`::after` pseudo-elements. `chroma-r` / `chroma-b` keyframes fire at ~95% intervals for glitch bursts. |
-| `TypewriterText` | `text`, `delay` | Types characters one-by-one with blinking cursor. Used in subtitles. |
-| `TiltCard` | `children`, `className` | 3D tilt on mousemove using CSS `perspective` + `rotateX/Y`. Max ±12° tilt. |
-| `AnimatedBorder` | `children`, `className`, `electric?` | Wraps content in a 1px rotating conic-gradient border (emerald→cyan). Electric variant has sparser sparks. Inner content sits on `.card-inner` with dark glass background. |
-| `WaveformBars` | — | 5 animated bars with `wave-bar` keyframe + staggered `animation-delay`. Used in pipeline active state. |
-| `CelebrationBurst` | — | 12 radial particles that burst outward on job completion. |
-| `BootSequence` | — | Terminal cold-boot overlay. Renders on first mount, types `BOOT_LINES` at 155ms/line, fades at 650ms after last line, unmounts at 1450ms. Has its own nested `MatrixRain` behind the terminal card. Phases: `"booting"` → `"fading"` → `"done"` (unmounts). |
-
-### Pipeline / Result Views
+### Pipeline Components
 
 | Component | Description |
 |-----------|-------------|
-| `PipelineNode` | Single step card with status icon, progress ring, timing. |
-| `PipelineConnector` | Vertical connector line between steps, fills emerald when active. |
-| `MetricPill` | Small stat badge (label + value). |
-| `TranscriptPanel` | Scrollable list of transcript segments with speaker color coding. |
-| `SyncedPlayer` | Side-by-side original + dubbed video players that stay in sync. |
-| `StepIcon` | Returns appropriate Lucide icon per pipeline step. |
+| `PipelineNode` | Single step card: 40×40 rounded-lg icon box + label underneath. Three states: `pending` (dim white), `active` (green with pulse-ring animation), `done` (green with checkmark). 7 steps: Chunk → Diarize → Transcribe → Translate → Synthesize → Quality → Composite. |
+| `PipelineConnector` | Horizontal 32px line between pipeline steps. Fills green when lit, has a beam animation sweep when active. |
+| `MetricPill` | Small stat badge (`label + value`). Shows chunks, speakers, segments, and container counts. Green value + muted label on a subtle card background. |
+| `TranscriptPanel` | Scrollable list (max 240px) of transcript segments. Each segment shows speaker dot + name (color-coded), timestamps, original text, and translated text. Speaker colors assigned in order from `SPEAKER_COLORS` array. |
+| `StepIcon` | Returns the appropriate SVG icon per pipeline step key. Icons: scissors, users, mic, globe, waveform, check, film. All rendered as 16×16 outline stroke SVGs. |
+
+### Result Components
+
+| Component | Description |
+|-----------|-------------|
+| `SyncedPlayer` | Side-by-side original + dubbed video players in a 2-column grid. Videos stay in sync via `onTimeUpdate` (re-syncs if drift > 0.3s). Shared play/pause button (green circle) and range scrubber. Dubbed label is green-colored for distinction. |
+
+### Helper Functions
+
+| Function | Description |
+|----------|-------------|
+| `getStepStatus(step, currentStep, progress)` | Maps the current status string to a pipeline step state (`pending`/`active`/`done`) using keyword matching. |
+| `formatTime(s)` | Formats seconds as `M:SS`. |
+
+---
+
+## App Phases
+
+### 1. Boot (BootSequence)
+Full-screen black overlay → monospace terminal card types system init lines → fades out → unmounts.
+
+### 2. Landing (no jobId)
+Two-column grid. Left: eyebrow badge ("HackIllinois 2026" with pulse dot), hero title ("Any voice. / Any language."), description paragraph, three stat pills (40+ GPU Containers, ∞ Any Length, 10 Languages). Right: drag-and-drop zone (file upload), 5×2 language grid (10 languages with flag emoji), "Dub this video →" submit button.
+
+### 3. Pipeline (running/queued status)
+Rounded card with: status row (pulse dot + typewriter step label + progress %), full-width progress bar with shimmer, 7-step pipeline node chain with connectors, waveform visualizer. Below: metric pills row + transcript panel.
+
+### 4. Error
+Centered card with red styling. Error icon + "Pipeline error" heading + error message. "← Try again" link resets state.
+
+### 5. Result (done status)
+"Dubbing complete" heading + download button (green). Synced side-by-side video player. Transcript panel. "← Dub another video" link resets state.
 
 ---
 
@@ -114,118 +134,74 @@
 
 | Name | Duration | Usage |
 |------|----------|-------|
-| `fadeIn` | 0.55s | Section enters, cards appearing |
-| `slideUp` | 0.75s | Subtitle, pipeline section entry |
-| `stagger-in` | 0.5s | Repeated list items |
-| `shake` | 0.6s | Error state |
-| `glow` | 2.5s ∞ | Emerald glow pulse on elements |
-| `neon-pulse` | 2s ∞ | Drop-shadow pulse on icons |
-| `aurora1/2/3` | 20–26s ∞ | Aurora blob drift |
-| `float` | varies ∞ | Particle upward float |
-| `geo-drift/spin` | varies ∞ | Background geometry motion |
-| `text-shine` | 4–5s ∞ | Gradient text shimmer (decode-locked chars) |
-| `chroma-r/b` | ∞ | Chromatic aberration glitch bursts |
-| `hero-glitch` | 9s ∞ | Full hero section glitch skew/hue |
-| `blink-cursor` | 1s ∞ | Typewriter cursor blink |
-| `shimmer` | 0.6–1.8s | Button hover + progress bar shine |
-| `pulse-ring` | 2s ∞ | Expanding ring on active elements |
-| `beam` | varies | Scan beam across dropzone on drag |
-| `spin` | 2–3s ∞ | Animated border conic rotation |
-| `gradient-shift` | 4s ∞ | Gradient background pan |
-| `wave-bar` | varies ∞ | Pipeline waveform bars |
-| `drop-glow` | 3s ∞ | Dropzone idle glow |
-| `logo-morph` | 7s ∞ | Logo border-radius morphing |
-| `upload-bounce` | 2s ∞ | Upload icon bounce |
-| `decode-glow` | 1.2s fwd | One-shot title reveal glow |
+| `fadeIn` | 0.45s | Section entries, cards appearing, pipeline nodes (staggered), transcript segments |
+| `slideUp` | 0.45s | Hero subtitle, stats row, upload card, pipeline/result view entry |
+| `shimmer` | 2s ∞ | Progress bar shine effect (pseudo-element sweeps across) |
+| `spin` | 0.8s ∞ | Upload spinner |
+| `wave-bar` | 380–880ms ∞ | Pipeline waveform bars (alternating, staggered delays) |
+| `pulse-ring` | 1.8s ∞ | Expanding ring on active pipeline nodes |
+| `beam` | 1.2s ∞ | Sweep across active pipeline connectors |
+| `blink-cursor` | 1s ∞ | Typewriter cursor blink (boot sequence + pipeline status) |
 
-### Decode Char States (CSS Classes)
-
-```css
-.decode-idle   { color: rgba(16,185,129,0.08); }              /* barely visible */
-.decode-active { color: #4ade80; text-shadow: 0 0 14px …; }   /* bright cycling */
-.decode-locked { gradient text + text-shine animation; }       /* final state */
-```
+### Tailwind Animations (via config)
+- `animate-fade-in` → `fadeIn 0.45s ease-out forwards`
+- `animate-slide-up` → `slideUp 0.45s ease-out forwards`
+- `animate-pulse-ring` → `pulse-ring 1.8s ease-out infinite`
+- `animate-pulse` (built-in) → used for status dots
 
 ---
 
-## Changelog
+## CSS Details (`index.css`)
 
-### Session 1 (2026-02-28)
+- **Body**: `font-family: 'Space Grotesk'`, `background: #000`, `letter-spacing: -0.01em`, `overflow: hidden`
+- **Progress bar shimmer**: `.progress-bar::after` — 40%-width gradient sweep via `shimmer` keyframe
+- **Scrollbar**: 4px width, transparent track, `rgba(255,255,255,0.08)` thumb
+- **Text selection**: `rgba(98,222,97,0.2)` background (green tint)
+- **Range input**: Custom styled — 3px track, 14px green thumb, hover scale effect
 
-#### MatrixRain — Complete Rewrite
-- **Before**: `setInterval`-based, single green color, uniform speed
-- **After**: `requestAnimationFrame`, three color modes (emerald/cyan/violet), variable speed (`stepMax` 2–5 frames), head glow via `ctx.shadowBlur=5`, reduced aggression (trail opacity 0.13, fade alpha 0.12)
+---
 
-#### New: MatrixDecodeTitle
-- Character-by-character matrix decode animation
-- Chars cycle through katakana + symbols (`DECODE_CHARS`) before locking into final letter
-- Three visual phases per char: idle → active → locked
-- Staggered start times (72ms per char position)
-- Uses `lockCountRef` (ref, not state) for lock counting to avoid re-renders
-- Fires `animate-decode-glow` when all chars lock
+## Data Configuration
 
-#### New: ScanlineOverlay
-- Subtle CRT horizontal scanlines via `repeating-linear-gradient`
-- Fixed, full-screen, pointer-events-none
+### Languages (hardcoded array)
+10 languages: Spanish, French, German, Arabic, Mandarin, Japanese, Portuguese, Hindi, Korean, Italian. Each with ISO code + flag emoji.
 
-#### New: BootSequence
-- Terminal-style cold boot that plays on first load
-- Types system status lines at 155ms/line
-- Fades and unmounts automatically (1.45s after completion)
-- MatrixRain runs behind it for depth
+### Pipeline Steps (hardcoded array)
+7 steps: `chunking` → `diarizing` → `transcribing` → `translating` → `synthesizing` → `quality` → `compositing`.
 
-#### Layout: Two-Column No-Scroll
-- Completely restructured `<main>` to `height: calc(100vh - 57px)` with flexbox
-- Landing: `grid grid-cols-[1fr,1fr] gap-14 items-center`
-- `body { overflow: hidden }` prevents scroll on landing
-- Pipeline/result views use `flex-1 overflow-y-auto`
-
-#### Dropzone Redesign
-- Compact (`p-8` vs old `p-16`)
-- SVG icons replacing emoji
-- Animated corner brackets that expand on hover/drag
-- Scanning beam animation on active drag
-- Glassmorphism background: `rgba(5,5,12,0.75)`
-
-#### Language Grid Redesign
-- `grid grid-cols-5 gap-1.5` (5×2 fixed layout, was flex-wrap)
-- Flag emoji + small text label per slot
-- Neon emerald glow + shimmer on selected state
-
-#### Hero Stats Row
-- Three data pills: "40+ GPU Containers", "∞ Any Film Length", "10 Languages"
-- Emerald→cyan gradient text
+### Speaker Colors
+7-color palette cycling: green, blue, pink, orange, purple, teal, amber.
 
 ---
 
 ## Design Goals & Roadmap
 
 ### Completed
-- [x] Matrix rain atmospheric (not dominant)
+- [x] Clean dark minimal UI (replaced matrix/aurora/effects design)
 - [x] Terminal boot sequence on load
-- [x] Matrix decode title animation
-- [x] CRT scanline overlay
 - [x] No-scroll single-frame landing layout
-- [x] Compact dropzone with animated corners + beam
+- [x] Compact dropzone with file state
 - [x] Language grid (5×2)
 - [x] Hero stats row
+- [x] Pipeline dashboard with 7-step visualization
+- [x] Waveform visualizer
+- [x] Synced side-by-side video player
+- [x] Transcript panel with speaker color coding
+- [x] Metric pills (chunks, speakers, segments, containers)
+- [x] Error state display
 
 ### Planned / Ideas
 - [ ] **Responsive design** — mobile/tablet layout (currently laptop/PC optimized)
-- [ ] **Dark mode variations** — consider a "synthwave" purple variant toggle
 - [ ] **Pipeline visualization** — animated chunk map (grid of chunk cards with live status)
-- [ ] **Speaker color coding** — consistent color per speaker across transcript, waveform, player
 - [ ] **Video player polish** — custom controls matching the dark theme, sync indicator
 - [ ] **Drag-to-reorder languages** — allow ranking preferred target language
-- [ ] **Micro-interactions** — button press ripples, card hover lift effects
 - [ ] **Progress granularity** — per-chunk progress bars in pipeline view
 - [ ] **Download screen** — celebratory result screen with stats (containers used, time saved, languages)
 - [ ] **Error recovery UX** — specific error messages with suggested fixes (e.g., file too large, unsupported format)
 - [ ] **Accessibility** — keyboard navigation, `prefers-reduced-motion` support, ARIA labels
-- [ ] **Performance audit** — profile canvas renders, check for unnecessary re-renders in pipeline polling
 
 ### Known Issues / Tech Debt
-- `MatrixDecodeTitle` uses many `setInterval` instances (one per char); consider batching into a single RAF loop for large titles
-- `BootSequence` timer cleanup — verify all `setTimeout`/`setInterval` refs are cleared on unmount
 - `body { overflow: hidden }` may conflict on very small screens — needs media query guard
 - Language grid is hardcoded to 10 languages — should derive from a config array
+- No loading skeleton for transcript panel — appears abruptly when data arrives
+- Video player has no error handling for failed loads

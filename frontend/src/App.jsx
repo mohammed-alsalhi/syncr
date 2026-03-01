@@ -1,19 +1,29 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react"
+import ES from "country-flag-icons/react/3x2/ES"
+import FR from "country-flag-icons/react/3x2/FR"
+import DE from "country-flag-icons/react/3x2/DE"
+import SA from "country-flag-icons/react/3x2/SA"
+import CN from "country-flag-icons/react/3x2/CN"
+import JP from "country-flag-icons/react/3x2/JP"
+import BR from "country-flag-icons/react/3x2/BR"
+import IN from "country-flag-icons/react/3x2/IN"
+import KR from "country-flag-icons/react/3x2/KR"
+import IT from "country-flag-icons/react/3x2/IT"
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000"
 const GREEN = "#62DE61"
 
 const LANGUAGES = [
-  { code: "es", label: "Spanish",    flag: "🇪🇸" },
-  { code: "fr", label: "French",     flag: "🇫🇷" },
-  { code: "de", label: "German",     flag: "🇩🇪" },
-  { code: "ar", label: "Arabic",     flag: "🇸🇦" },
-  { code: "zh", label: "Mandarin",   flag: "🇨🇳" },
-  { code: "ja", label: "Japanese",   flag: "🇯🇵" },
-  { code: "pt", label: "Portuguese", flag: "🇧🇷" },
-  { code: "hi", label: "Hindi",      flag: "🇮🇳" },
-  { code: "ko", label: "Korean",     flag: "🇰🇷" },
-  { code: "it", label: "Italian",    flag: "🇮🇹" },
+  { code: "es", label: "Spanish",    Flag: ES },
+  { code: "fr", label: "French",     Flag: FR },
+  { code: "de", label: "German",     Flag: DE },
+  { code: "ar", label: "Arabic",     Flag: SA },
+  { code: "zh", label: "Mandarin",   Flag: CN },
+  { code: "ja", label: "Japanese",   Flag: JP },
+  { code: "pt", label: "Portuguese", Flag: BR },
+  { code: "hi", label: "Hindi",      Flag: IN },
+  { code: "ko", label: "Korean",     Flag: KR },
+  { code: "it", label: "Italian",    Flag: IT },
 ]
 
 const PIPELINE_STEPS = [
@@ -69,7 +79,7 @@ function BootSequence() {
       style={{ opacity: phase === "fading" ? 0 : 1, transition: "opacity 0.8s ease-out", pointerEvents: phase === "fading" ? "none" : "all" }}
     >
       <div
-        className="font-mono text-sm max-w-xl w-full px-10 py-8 rounded-xl"
+        className="font-mono text-sm max-w-xl w-full px-4 py-6 sm:px-10 sm:py-8 rounded-xl"
         style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)" }}
       >
         <div className="text-white/25 text-[10px] mb-5 tracking-[0.4em] uppercase">System Init</div>
@@ -111,6 +121,35 @@ function TypewriterText({ text }) {
       {shown}
       <span className="text-white/30 ml-0.5" style={{ animation: "blink-cursor 1s step-end infinite" }}>▌</span>
     </span>
+  )
+}
+
+/* ── Sonar Rings Background ── */
+function SonarRings() {
+  const rings = useMemo(() => [
+    { delay: 0,   duration: 8  },
+    { delay: 1.6, duration: 8  },
+    { delay: 3.2, duration: 8  },
+    { delay: 4.8, duration: 8  },
+    { delay: 6.4, duration: 8  },
+  ], [])
+
+  return (
+    <div className="fixed inset-0 z-[1] pointer-events-none overflow-hidden">
+      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" style={{ width: "min(80vw, 80vh)", height: "min(80vw, 80vh)" }}>
+        {rings.map((r, i) => (
+          <div
+            key={i}
+            className="absolute inset-0 rounded-full"
+            style={{
+              border: `1px solid ${GREEN}`,
+              opacity: 0,
+              animation: `sonar-expand ${r.duration}s linear ${r.delay}s infinite backwards`,
+            }}
+          />
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -261,7 +300,7 @@ function TranscriptPanel({ segments }) {
 
   return (
     <div
-      className="p-5 max-h-60 overflow-y-auto rounded-xl"
+      className="p-3 sm:p-5 max-h-60 overflow-y-auto rounded-xl"
       style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)" }}
     >
       <div className="text-[9px] font-mono uppercase tracking-[0.25em] text-white/20 mb-4">Transcript</div>
@@ -310,7 +349,7 @@ function SyncedPlayer({ originalUrl, dubbedUrl, language }) {
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {[
           { ref: origRef, label: "Original",          muted: true,  onTime, onMeta: () => setDur(origRef.current?.duration || 0) },
           { ref: dubRef,  label: `Dubbed · ${langLabel}`, muted: false, onTime: undefined, onMeta: undefined },
@@ -333,7 +372,7 @@ function SyncedPlayer({ originalUrl, dubbedUrl, language }) {
           </div>
         ))}
       </div>
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-3 sm:gap-4">
         <button
           onClick={playing ? syncPause : syncPlay}
           className="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 transition-all hover:opacity-80 active:scale-95"
@@ -404,20 +443,20 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-black text-white font-sans">
-
+      {!jobId && <SonarRings />}
       {/* ── Header ── */}
       <header
-        className="sticky top-0 z-50 px-8 flex items-center justify-between backdrop-blur-xl"
-        style={{ height: "56px", background: "rgba(0,0,0,0.92)", borderBottom: "1px solid rgba(255,255,255,0.06)" }}
+        className="sticky top-0 z-50 px-4 sm:px-8 flex items-center justify-between backdrop-blur-xl"
+        style={{ height: "56px", background: "rgba(0,0,0,0.92)", borderBottom: "1px solid rgba(255,255,255,0.06)", animation: "fadeIn 0.5s ease-out both" }}
       >
-        <div className="flex items-center gap-3">
-          <div
-            className="w-6 h-6 rounded flex items-center justify-center text-[10px] font-black font-mono select-none flex-shrink-0"
-            style={{ background: GREEN, color: "#000" }}
-          >S</div>
-          <span className="text-sm font-semibold tracking-tight">Syncr</span>
-          <span className="text-white/15 select-none">·</span>
-          <span className="text-[10px] font-mono text-white/30 uppercase tracking-wider">AI Dubbing Studio</span>
+        <div className="flex items-center gap-3.5">
+          <svg viewBox="0 0 24 24" className="w-8 h-8 flex-shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M4 12L7 9L11 15L14 9L17 12" stroke={GREEN} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+            <path d="M7 15L10 18L14 12L17 18L20 15" stroke={GREEN} strokeWidth="2" strokeOpacity="0.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          <span className="text-base font-semibold tracking-tight">Syncr</span>
+          <span className="text-white/15 select-none hidden sm:inline">·</span>
+          <span className="text-[11px] font-mono text-white/30 uppercase tracking-wider hidden sm:inline">AI Dubbing Studio</span>
         </div>
         <div className="hidden sm:flex items-center gap-2 text-[11px] font-mono text-white/35">
           <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 animate-pulse" style={{ background: GREEN }} />
@@ -425,32 +464,32 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-8 flex flex-col" style={{ height: "calc(100vh - 56px)" }}>
+      <main className="relative max-w-6xl mx-auto px-4 sm:px-8 flex flex-col md:h-[calc(100vh-56px)] overflow-y-auto">
 
         {/* ══ LANDING ══ */}
         {!jobId && (
-          <div className="flex-1 grid grid-cols-[1fr,1fr] gap-12 items-center">
+          <div className="md:flex-1 grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-12 items-center py-6 md:py-0">
 
             {/* Left: Hero */}
-            <div className="flex flex-col justify-center">
+            <div className="relative flex flex-col justify-center min-w-0">
               <div
                 className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md text-[10px] font-mono text-white/35 tracking-widest uppercase mb-6 w-fit"
-                style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}
+                style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", animation: "slideUp 0.5s ease-out both" }}
               >
                 <span className="w-1 h-1 rounded-full animate-pulse flex-shrink-0" style={{ background: GREEN }} />
                 HackIllinois 2026
               </div>
 
-              <h1 className="text-[3.2rem] font-bold tracking-tight leading-[1.1] mb-5">
+              <h1 className="text-3xl sm:text-4xl md:text-[3.2rem] font-bold tracking-tight leading-[1.1] mb-5" style={{ animation: "slideUp 0.5s ease-out 0.1s both" }}>
                 Any voice.<br />
                 <span style={{ color: GREEN }}>Any language.</span>
               </h1>
 
-              <p className="text-white/40 text-[0.95rem] max-w-sm leading-relaxed mb-8" style={{ animation: "slideUp 0.5s ease-out 0.2s both" }}>
+              <p className="text-white/40 text-[0.95rem] leading-relaxed mb-8" style={{ animation: "slideUp 0.5s ease-out 0.2s both" }}>
                 Upload a video — every actor speaks your target language in their own cloned voice, orchestrated across parallel GPU containers.
               </p>
 
-              <div className="flex gap-3" style={{ animation: "slideUp 0.5s ease-out 0.35s both" }}>
+              <div className="flex gap-2 sm:gap-3" style={{ animation: "slideUp 0.5s ease-out 0.35s both" }}>
                 {[
                   { value: "40+", label: "GPU Containers" },
                   { value: "∞",   label: "Any Length"     },
@@ -461,7 +500,7 @@ export default function App() {
                     className="flex-1 py-3 px-3 rounded-xl text-center"
                     style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)" }}
                   >
-                    <div className="text-xl font-bold font-mono" style={{ color: GREEN }}>{s.value}</div>
+                    <div className="text-lg sm:text-xl font-bold font-mono" style={{ color: GREEN }}>{s.value}</div>
                     <div className="text-[9px] text-white/25 mt-0.5 uppercase tracking-wider font-mono">{s.label}</div>
                   </div>
                 ))}
@@ -469,14 +508,14 @@ export default function App() {
             </div>
 
             {/* Right: Upload card */}
-            <div className="flex flex-col gap-3 justify-center" style={{ animation: "slideUp 0.45s ease-out 0.1s both" }}>
+            <div className="flex flex-col gap-3 justify-center min-w-0" style={{ animation: "slideUp 0.45s ease-out 0.1s both" }}>
               {/* Drop zone */}
               <div
                 onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
                 onDragLeave={() => setIsDragging(false)}
                 onDrop={(e) => { e.preventDefault(); setIsDragging(false); handleFile(e.dataTransfer.files[0]) }}
                 onClick={() => fileRef.current?.click()}
-                className="relative rounded-xl p-8 text-center cursor-pointer transition-all duration-200"
+                className="relative rounded-xl p-4 sm:p-5 text-center cursor-pointer transition-all duration-200"
                 style={{
                   background: isDragging ? `${GREEN}08` : "rgba(255,255,255,0.02)",
                   border: isDragging ? `1px solid ${GREEN}55` : file ? `1px solid ${GREEN}35` : "1px solid rgba(255,255,255,0.08)",
@@ -511,7 +550,7 @@ export default function App() {
               </div>
 
               {/* Language grid */}
-              <div className="grid grid-cols-5 gap-1.5">
+              <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5">
                 {LANGUAGES.map((lang) => (
                   <button
                     key={lang.code}
@@ -523,8 +562,8 @@ export default function App() {
                       color:      language === lang.code ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.3)",
                     }}
                   >
-                    <span className="text-sm leading-none">{lang.flag}</span>
-                    <span className="text-[8px] leading-none font-mono mt-0.5 w-full text-center truncate px-0.5">{lang.label}</span>
+                    <lang.Flag className="w-5 h-auto rounded-sm" />
+                    <span className="text-[10px] sm:text-[8px] leading-none font-mono mt-0.5 w-full text-center truncate px-0.5">{lang.label}</span>
                   </button>
                 ))}
               </div>
@@ -552,9 +591,9 @@ export default function App() {
 
         {/* ══ PIPELINE DASHBOARD ══ */}
         {isRunning && (
-          <div className="flex-1 overflow-y-auto py-6 space-y-3" style={{ animation: "slideUp 0.4s ease-out forwards" }}>
+          <div className="flex-1 flex flex-col justify-center overflow-y-auto py-6 space-y-3" style={{ animation: "slideUp 0.4s ease-out forwards" }}>
             <div
-              className="p-6 rounded-xl"
+              className="p-4 sm:p-6 rounded-xl"
               style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)" }}
             >
               {/* Status row */}
@@ -575,7 +614,7 @@ export default function App() {
               </div>
 
               {/* Steps */}
-              <div className="flex items-start justify-center overflow-x-auto pb-1">
+              <div className="relative z-10 flex items-start justify-center overflow-x-auto pb-1 pt-6">
                 {PIPELINE_STEPS.map((step, i) => {
                   const s = getStepStatus(step, status?.step, status?.progress || 0)
                   return (
@@ -631,15 +670,15 @@ export default function App() {
         {/* ══ RESULT ══ */}
         {isDone && originalUrl && dubbedUrl && (
           <div className="flex-1 overflow-y-auto py-6 space-y-5" style={{ animation: "slideUp 0.4s ease-out forwards" }}>
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div>
-                <h2 className="text-2xl font-bold">Dubbing complete</h2>
+                <h2 className="text-xl sm:text-2xl font-bold">Dubbing complete</h2>
                 <p className="text-white/35 text-sm mt-0.5 font-mono">Your video is ready</p>
               </div>
               <a
                 href={dubbedUrl}
                 download="syncr_dubbed.mp4"
-                className="px-5 py-2.5 rounded-xl font-semibold text-sm transition-all hover:opacity-90 active:scale-95"
+                className="px-5 py-2.5 rounded-xl font-semibold text-sm transition-all hover:opacity-90 active:scale-95 flex-shrink-0"
                 style={{ background: GREEN, color: "#000" }}
               >Download ↓</a>
             </div>
