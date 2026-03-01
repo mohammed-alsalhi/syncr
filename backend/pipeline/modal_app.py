@@ -21,6 +21,7 @@ cpu_image = (
         "aiofiles",
         "python-dotenv",
         "pydub",
+        "scipy",
     )
     .add_local_python_source("pipeline")
 )

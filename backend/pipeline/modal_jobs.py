@@ -38,6 +38,16 @@ def _update_progress(job_id: str, **kwargs):
         pass  # Best-effort — progress updates are non-critical
 
 
+def _normalize_embedding(emb: list[float]) -> list[float]:
+    """Normalize an embedding vector to unit length for reliable cosine similarity."""
+    if not emb:
+        return emb
+    norm = sum(x * x for x in emb) ** 0.5
+    if norm == 0:
+        return emb
+    return [x / norm for x in emb]
+
+
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Compute cosine similarity between two embedding vectors."""
     if not a or not b or len(a) != len(b):
@@ -55,10 +65,11 @@ def _merge_similar_speakers(segments: list[dict], threshold: float = 0.78) -> li
     Merge over-segmented speakers within a single chunk using embedding similarity.
 
     Pyannote sometimes splits one real speaker into multiple labels (e.g. finding
-    5 speakers when there are only 3). This compares all speaker pairs via cosine
-    similarity on their embeddings and merges those above the threshold.
+    5 speakers when there are only 3). Uses agglomerative clustering with complete
+    linkage — only merges two clusters when ALL pairs between them exceed the
+    similarity threshold — to avoid cascading merge errors.
 
-    Uses a lower threshold than cross-chunk matching (0.78 vs 0.85) because
+    Uses a lower threshold than cross-chunk matching (0.78 vs 0.80) because
     within-chunk embeddings come from identical audio conditions, so same-speaker
     pairs have naturally higher similarity scores.
 
@@ -73,7 +84,7 @@ def _merge_similar_speakers(segments: list[dict], threshold: float = 0.78) -> li
     if not segments:
         return segments
 
-    # Collect representative embedding per local speaker (from longest segment)
+    # Collect representative embedding per local speaker (normalized, from longest segment)
     speaker_embeddings: dict[str, list[float]] = {}
     speaker_durations: dict[str, float] = {}
     for seg in segments:
@@ -81,51 +92,66 @@ def _merge_similar_speakers(segments: list[dict], threshold: float = 0.78) -> li
         emb = seg.get("embedding", [])
         dur = seg["end"] - seg["start"]
         if emb and (spk not in speaker_embeddings or dur > speaker_durations.get(spk, 0)):
-            speaker_embeddings[spk] = emb
+            speaker_embeddings[spk] = _normalize_embedding(emb)
             speaker_durations[spk] = dur
 
     if len(speaker_embeddings) <= 1:
         return segments  # Nothing to merge
 
-    # Greedy clustering: compare each speaker to existing clusters
-    clusters: list[dict] = []  # [{label, embedding, members: [local_speaker, ...]}]
+    # Agglomerative clustering with complete linkage.
+    # Start with each speaker in its own cluster. Repeatedly merge the two
+    # most similar clusters, but only if ALL pairwise similarities exceed threshold.
+    # This prevents cascading merges that drag embeddings away from true identity.
+    speakers = list(speaker_embeddings.keys())
+    # clusters: list of sets of speaker labels, with a fixed representative embedding
+    # (the embedding of the longest-duration speaker in the cluster — no averaging/drift)
+    clusters: list[dict] = []
+    for spk in speakers:
+        clusters.append({
+            "members": {spk},
+            "embedding": speaker_embeddings[spk],  # Fixed, no drift
+        })
 
-    for local_spk, emb in speaker_embeddings.items():
-        matched = False
-        for cluster in clusters:
-            sim = _cosine_similarity(emb, cluster["embedding"])
-            if sim > threshold:
-                cluster["members"].append(local_spk)
-                # Update cluster embedding as duration-weighted average
-                old_weight = cluster["total_duration"]
-                new_weight = speaker_durations[local_spk]
-                total = old_weight + new_weight
-                cluster["embedding"] = [
-                    (a * old_weight + b * new_weight) / total
-                    for a, b in zip(cluster["embedding"], emb)
-                ]
-                cluster["total_duration"] = total
-                matched = True
-                break
-        if not matched:
-            clusters.append({
-                "label": f"SPEAKER_{len(clusters):02d}",
-                "embedding": emb,
-                "members": [local_spk],
-                "total_duration": speaker_durations[local_spk],
-            })
+    # Iteratively merge most-similar pair above threshold
+    changed = True
+    while changed and len(clusters) > 1:
+        changed = False
+        best_sim = -1.0
+        best_i, best_j = -1, -1
+
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                # Complete linkage: minimum similarity across all pairs
+                min_sim = float("inf")
+                for spk_a in clusters[i]["members"]:
+                    for spk_b in clusters[j]["members"]:
+                        sim = _cosine_similarity(speaker_embeddings[spk_a], speaker_embeddings[spk_b])
+                        min_sim = min(min_sim, sim)
+                if min_sim > best_sim:
+                    best_sim = min_sim
+                    best_i, best_j = i, j
+
+        if best_sim > threshold and best_i >= 0:
+            # Merge j into i, keep the embedding of the longest-duration member
+            merged_members = clusters[best_i]["members"] | clusters[best_j]["members"]
+            # Pick embedding from the member with the most total speech
+            best_spk = max(merged_members, key=lambda s: speaker_durations.get(s, 0))
+            clusters[best_i]["members"] = merged_members
+            clusters[best_i]["embedding"] = speaker_embeddings[best_spk]
+            clusters.pop(best_j)
+            changed = True
 
     # Build mapping: old speaker label → new merged label
     speaker_map: dict[str, str] = {}
-    for cluster in clusters:
+    for idx, cluster in enumerate(clusters):
+        label = f"SPEAKER_{idx:02d}"
         for member in cluster["members"]:
-            speaker_map[member] = cluster["label"]
+            speaker_map[member] = label
 
-    # Relabel segments and update embeddings
+    # Relabel segments and update embeddings (use cluster's fixed embedding)
     for seg in segments:
         old_spk = seg["speaker"]
         seg["speaker"] = speaker_map.get(old_spk, old_spk)
-        # Update embedding to the cluster's merged embedding
         for cluster in clusters:
             if old_spk in cluster["members"]:
                 seg["embedding"] = cluster["embedding"]
@@ -140,13 +166,14 @@ def _match_speakers_across_chunks(all_segments: list[dict], chunk_results: list[
 
     Each chunk has its own local speaker labels (SPEAKER_00, SPEAKER_01, etc.).
     This function compares speaker embeddings across chunks and assigns a
-    global speaker ID when similarity > 0.85.
+    global speaker ID using optimal bipartite matching (Hungarian algorithm)
+    rather than greedy first-match, preventing incorrect speaker merges.
 
     Falls back to chunk-prefixed speaker names if embeddings are unavailable.
     """
-    SIMILARITY_THRESHOLD = 0.85
+    SIMILARITY_THRESHOLD = 0.80
 
-    # Collect one representative embedding per (chunk, local_speaker)
+    # Collect one representative embedding per (chunk, local_speaker), normalized
     chunk_speaker_embeddings: dict[tuple[int, str], list[float]] = {}
     for cr in chunk_results:
         chunk_idx = cr["chunk_idx"]
@@ -154,7 +181,7 @@ def _match_speakers_across_chunks(all_segments: list[dict], chunk_results: list[
             key = (chunk_idx, seg["speaker"])
             emb = seg.get("embedding", [])
             if key not in chunk_speaker_embeddings and emb:
-                chunk_speaker_embeddings[key] = emb
+                chunk_speaker_embeddings[key] = _normalize_embedding(emb)
 
     if not chunk_speaker_embeddings:
         # No embeddings available — prefix speaker names with chunk index to avoid collisions
@@ -165,24 +192,79 @@ def _match_speakers_across_chunks(all_segments: list[dict], chunk_results: list[
                     break
         return all_segments
 
-    # Build global speaker clusters via greedy matching
+    # Build global speaker clusters using iterative optimal matching.
+    # Process chunks in order. For each new chunk, compute the full similarity
+    # matrix between the chunk's speakers and existing global clusters, then
+    # use the Hungarian algorithm to find the optimal assignment.
+    from scipy.optimize import linear_sum_assignment
+
     # global_speakers: list of {global_id, embedding, members: [(chunk_idx, local_speaker)]}
     global_speakers: list[dict] = []
 
+    # Group speakers by chunk
+    speakers_by_chunk: dict[int, list[tuple[tuple[int, str], list[float]]]] = {}
     for (chunk_idx, local_speaker), emb in chunk_speaker_embeddings.items():
-        matched = False
-        for gs in global_speakers:
-            sim = _cosine_similarity(emb, gs["embedding"])
-            if sim > SIMILARITY_THRESHOLD:
-                gs["members"].append((chunk_idx, local_speaker))
-                matched = True
-                break
-        if not matched:
+        speakers_by_chunk.setdefault(chunk_idx, []).append(((chunk_idx, local_speaker), emb))
+
+    for chunk_idx in sorted(speakers_by_chunk.keys()):
+        chunk_speakers = speakers_by_chunk[chunk_idx]
+
+        if not global_speakers:
+            # First chunk: all speakers become new global speakers
+            for (key, emb) in chunk_speakers:
+                global_speakers.append({
+                    "global_id": f"SPEAKER_{len(global_speakers):02d}",
+                    "embedding": emb,
+                    "members": [key],
+                })
+            continue
+
+        # Build cost matrix: rows = chunk speakers, cols = global speakers
+        # Cost = 1 - similarity (lower = better match)
+        n_chunk = len(chunk_speakers)
+        n_global = len(global_speakers)
+
+        cost_matrix = []
+        for (key, emb) in chunk_speakers:
+            row = []
+            for gs in global_speakers:
+                sim = _cosine_similarity(emb, gs["embedding"])
+                row.append(1.0 - sim)
+            cost_matrix.append(row)
+
+        # Pad cost matrix to square if needed (more chunk speakers than global)
+        # Extra columns represent "new speaker" with cost = 1 - threshold
+        new_speaker_cost = 1.0 - SIMILARITY_THRESHOLD
+        max_dim = max(n_chunk, n_global)
+        padded_cost = []
+        for i in range(max_dim):
+            row = []
+            for j in range(max_dim):
+                if i < n_chunk and j < n_global:
+                    row.append(cost_matrix[i][j])
+                else:
+                    row.append(new_speaker_cost)
+            padded_cost.append(row)
+
+        row_ind, col_ind = linear_sum_assignment(padded_cost)
+
+        for r, c in zip(row_ind, col_ind):
+            if r >= n_chunk:
+                continue  # Padding row, skip
+            key, emb = chunk_speakers[r]
+            if c < n_global:
+                sim = _cosine_similarity(emb, global_speakers[c]["embedding"])
+                if sim > SIMILARITY_THRESHOLD:
+                    global_speakers[c]["members"].append(key)
+                    print(f"[match] {key} → {global_speakers[c]['global_id']} (sim={sim:.3f})")
+                    continue
+            # No match above threshold — create new global speaker
             global_speakers.append({
                 "global_id": f"SPEAKER_{len(global_speakers):02d}",
                 "embedding": emb,
-                "members": [(chunk_idx, local_speaker)],
+                "members": [key],
             })
+            print(f"[match] {key} → new {global_speakers[-1]['global_id']}")
 
     # Build lookup: (chunk_idx, local_speaker) → global_id
     speaker_map: dict[tuple[int, str], str] = {}
@@ -687,7 +769,7 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
                 seg_clip = original_audio[start_ms:end_ms]
                 print(f"[coordinator]   {spk} seg {s['start']:.1f}-{s['end']:.1f}s -> {len(seg_clip)}ms")
                 clip += seg_clip
-                if len(clip) >= 2000:  # 2s for generous margin
+                if len(clip) >= 4000:  # 4s — ElevenLabs clones best at 3-5s
                     break
 
             # Write to a temp WAV file and read back (more reliable than BytesIO)

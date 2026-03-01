@@ -179,7 +179,9 @@ def merge_chunks(
     original_audio = AudioSegment.from_file(original_video)
 
     # 4. Overlay each dubbed segment at its absolute timestamp
-    FADE_MS = 30  # Short crossfade to eliminate hard starts/stops
+    FADE_MS = 100   # Crossfade duration — long enough to mask gain discontinuities
+    MAX_GAIN_DB = 6  # Clamp gain adjustment to avoid amplitude spikes at boundaries
+    MAX_SPEEDUP = 3.0  # Cap speedup to avoid quality degradation
 
     for seg in segments:
         dubbed_path = seg["dubbed_audio_path"]
@@ -190,6 +192,7 @@ def merge_chunks(
         # Speed up if dubbed audio is longer than its time slot
         if len(dubbed_clip) > target_duration_ms and target_duration_ms > 0:
             speed_factor = len(dubbed_clip) / target_duration_ms
+            speed_factor = min(speed_factor, MAX_SPEEDUP)  # Cap to avoid artifacts
             atempo_chain = _build_atempo_chain(speed_factor)
             sped_up_path = dubbed_path + ".speed.wav"
             subprocess.run(
@@ -211,14 +214,16 @@ def merge_chunks(
         # are louder, distant shots quieter, whispers vs shouts, etc.
         # ElevenLabs synthesizes at a uniform level, so we adjust each
         # dubbed clip to match the loudness of the original at that timestamp.
+        # Gain is clamped to ±MAX_GAIN_DB to prevent harsh amplitude jumps
+        # at segment boundaries that cause pops/clicks.
         orig_clip = original_audio[position_ms:position_ms + target_duration_ms]
         if orig_clip.dBFS > -50 and dubbed_clip.dBFS > -50:
             gain_db = orig_clip.dBFS - dubbed_clip.dBFS
+            gain_db = max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain_db))
             dubbed_clip = dubbed_clip.apply_gain(gain_db)
 
-        # Apply short fade-in/fade-out to eliminate hard pops and clicks
-        # at segment boundaries. 30ms is short enough to be inaudible
-        # as a fade but eliminates the "choppy" hard-cut feel.
+        # Apply fade-in/fade-out AFTER gain to smooth any remaining
+        # amplitude discontinuities at segment boundaries.
         if len(dubbed_clip) > FADE_MS * 2:
             dubbed_clip = dubbed_clip.fade_in(FADE_MS).fade_out(FADE_MS)
 

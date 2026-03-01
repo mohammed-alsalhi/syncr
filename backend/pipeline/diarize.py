@@ -79,6 +79,8 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
     # ── Extract speaker embeddings ──
     # Use pyannote's embedding model to compute a representative vector
     # per speaker. The coordinator uses these for cross-chunk matching.
+    # Average embeddings across up to 3 longest segments per speaker for
+    # robustness — a single segment may be an outlier (whisper, shout, etc).
     try:
         embedding_model = Inference(
             "pyannote/wespeaker-voxceleb-resnet34-LM",
@@ -86,21 +88,41 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
         )
         embedding_model.to(device)
 
-        # Compute embedding from the longest segment per speaker
-        speaker_best_seg: dict[str, dict] = {}
+        # Collect top-3 longest segments per speaker (>= 1s to avoid noise)
+        speaker_segs: dict[str, list[dict]] = {}
         for seg in segments:
             spk = seg["speaker"]
-            if spk not in speaker_best_seg or (seg["end"] - seg["start"]) > (speaker_best_seg[spk]["end"] - speaker_best_seg[spk]["start"]):
-                speaker_best_seg[spk] = seg
+            if (seg["end"] - seg["start"]) >= 1.0:
+                speaker_segs.setdefault(spk, []).append(seg)
+
+        # Fallback: if no segments >= 1s, use all segments
+        for seg in segments:
+            spk = seg["speaker"]
+            if spk not in speaker_segs:
+                speaker_segs.setdefault(spk, []).append(seg)
 
         speaker_embeddings: dict[str, list[float]] = {}
-        for spk, seg in speaker_best_seg.items():
-            emb = embedding_model(seg["audio_path"])
-            # pyannote returns a numpy array
-            if isinstance(emb, np.ndarray):
-                speaker_embeddings[spk] = emb.tolist()
-            else:
-                speaker_embeddings[spk] = list(emb)
+        for spk, segs_list in speaker_segs.items():
+            # Sort by duration, take top 3
+            top_segs = sorted(segs_list, key=lambda s: s["end"] - s["start"], reverse=True)[:3]
+            embeddings = []
+            for seg in top_segs:
+                emb = embedding_model(seg["audio_path"])
+                if isinstance(emb, np.ndarray):
+                    emb_list = emb.tolist()
+                else:
+                    emb_list = list(emb)
+                embeddings.append(emb_list)
+
+            # Average embeddings and normalize to unit length
+            if embeddings:
+                dim = len(embeddings[0])
+                avg = [sum(e[d] for e in embeddings) / len(embeddings) for d in range(dim)]
+                # Normalize to unit length
+                norm = sum(x * x for x in avg) ** 0.5
+                if norm > 0:
+                    avg = [x / norm for x in avg]
+                speaker_embeddings[spk] = avg
 
         # Attach embedding to each segment
         for seg in segments:
