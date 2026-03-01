@@ -8,7 +8,7 @@ Level 3: synthesize_speaker (CPU) — per-speaker voice cloning + TTS
 """
 
 import modal
-from pipeline.modal_app import app, gpu_image, cpu_image, whisper_image
+from pipeline.modal_app import app, gpu_image, cpu_image, whisper_image, volume, web_image
 
 
 # ── Progress helper ───────────────────────────────────────────────────────────
@@ -649,6 +649,7 @@ def separate_audio(audio_bytes: bytes) -> bytes:
     timeout=900,
     max_containers=2,
     secrets=[modal.Secret.from_name("mimic-secrets")],
+    volumes={"/data": volume},
 )
 def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
     """
@@ -663,7 +664,8 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
     import io
     import time
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    try:
+      with tempfile.TemporaryDirectory() as tmpdir:
         # Save input video
         input_path = os.path.join(tmpdir, "input.mp4")
         with open(input_path, "wb") as f:
@@ -870,8 +872,6 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
             accompaniment_bytes=accompaniment_bytes,
         )
 
-        _update_progress(job_id, step="Done!", progress=100, status="done")
-
         # Build transcript preview for frontend
         transcript = [
             {
@@ -883,7 +883,130 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
             }
             for s in all_segments
         ]
-        _update_progress(job_id, transcript_preview=transcript)
 
+        # Read output bytes
         with open(output_path, "rb") as f:
-            return f.read()
+            output_bytes = f.read()
+
+        # Save to shared volume so the web endpoint can serve the download
+        vol_output = f"/data/outputs/{job_id}_dubbed.mp4"
+        os.makedirs(os.path.dirname(vol_output), exist_ok=True)
+        with open(vol_output, "wb") as f:
+            f.write(output_bytes)
+        volume.commit()
+
+        # Mark as done AFTER saving to volume (prevents download race condition)
+        _update_progress(
+            job_id, step="Done!", progress=100, status="done",
+            output_url=f"/download/{job_id}",
+            transcript_preview=transcript,
+        )
+
+        return output_bytes
+
+    except Exception as e:
+        _update_progress(
+            job_id, status="error", step="Pipeline failed",
+            progress=0, error=str(e),
+        )
+        raise
+
+
+# ── Web Endpoint (ASGI) ─────────────────────────────────────────────────────
+
+@app.function(
+    image=web_image,
+    volumes={"/data": volume},
+    timeout=60,
+    allow_concurrent_inputs=100,
+    container_idle_timeout=300,
+)
+@modal.asgi_app()
+def web():
+    """
+    ASGI web endpoint serving the Syncr API.
+    Replaces the local FastAPI server for production deployment on Modal.
+    """
+    from fastapi import FastAPI, UploadFile, File, Form
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import FileResponse, JSONResponse
+    import uuid
+    import os
+
+    api = FastAPI(title="Syncr API", version="1.0.0")
+
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "https://synr.tech",
+            "https://www.synr.tech",
+            "http://localhost:5173",
+        ],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @api.post("/dub")
+    async def create_dub(
+        file: UploadFile = File(...),
+        target_language: str = Form("es"),
+    ):
+        job_id = str(uuid.uuid4())
+        video_bytes = await file.read()
+
+        # Initialize progress in modal.Dict
+        _update_progress(
+            job_id,
+            job_id=job_id,
+            status="queued",
+            step="Waiting to start",
+            progress=0,
+        )
+
+        # Spawn coordinator (non-blocking — returns immediately)
+        coordinator.spawn(video_bytes, target_language, job_id)
+
+        return {"job_id": job_id}
+
+    @api.get("/status/{job_id}")
+    async def get_status(job_id: str):
+        try:
+            progress_dict = _get_progress_dict()
+            data = progress_dict.get(job_id)
+            if data and isinstance(data, dict):
+                data.setdefault("job_id", job_id)
+                if data.get("status") == "done":
+                    data.setdefault("output_url", f"/download/{job_id}")
+                return data
+        except Exception:
+            pass
+        return {
+            "job_id": job_id,
+            "status": "unknown",
+            "step": "Job not found",
+            "progress": 0,
+        }
+
+    @api.get("/download/{job_id}")
+    async def download(job_id: str):
+        import asyncio
+
+        output_path = f"/data/outputs/{job_id}_dubbed.mp4"
+
+        # Retry with volume reload (handles propagation delay after commit)
+        for _ in range(3):
+            volume.reload()
+            if os.path.exists(output_path):
+                return FileResponse(
+                    output_path,
+                    media_type="video/mp4",
+                    filename="dubbed.mp4",
+                )
+            await asyncio.sleep(1)
+
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Output not ready"},
+        )
+
+    return api

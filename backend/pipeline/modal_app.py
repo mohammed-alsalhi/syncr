@@ -11,6 +11,9 @@ import modal
 
 app = modal.App("syncr")
 
+# Shared Volume for uploads/outputs across web endpoint and coordinator
+volume = modal.Volume.from_name("syncr-storage", create_if_missing=True)
+
 # CPU image — lightweight, used by coordinator, synthesis, and translation containers
 cpu_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -24,6 +27,15 @@ cpu_image = (
         "scipy",
     )
     .add_local_python_source("pipeline")
+)
+
+# Web image — lightweight, for ASGI web endpoint only
+web_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "fastapi",
+        "python-multipart",
+    )
 )
 
 # GPU image — heavy, used by process_chunk containers (diarization needs GPU)

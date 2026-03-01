@@ -13,7 +13,11 @@ app = FastAPI(title="Mimic API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://synr.tech",
+        "https://www.synr.tech",
+        "http://localhost:5173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
