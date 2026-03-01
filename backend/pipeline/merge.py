@@ -76,6 +76,17 @@ def _build_background_track(
     if accompaniment_bytes:
         # Demucs path: clean accompaniment with original voices removed
         bg = AudioSegment.from_file(io.BytesIO(accompaniment_bytes))
+
+        # Demucs adds symmetric padding (extra samples at start and end)
+        # for its sliding-window processing. If we just trim from the end,
+        # the start padding stays and shifts the entire background audio late.
+        # Center-trim: remove equal padding from both ends to stay in sync.
+        if len(bg) > total_duration_ms:
+            excess = len(bg) - total_duration_ms
+            trim_start = excess // 2
+            bg = bg[trim_start:trim_start + total_duration_ms]
+            print(f"[merge] Demucs center-trim: removed {excess}ms padding "
+                  f"({trim_start}ms from start, {excess - trim_start}ms from end)")
     else:
         # Fallback path: original audio with ducking during speech
         bg = AudioSegment.from_file(original_video)
@@ -83,7 +94,7 @@ def _build_background_track(
     # Ensure background matches expected duration (trim or pad)
     if len(bg) < total_duration_ms:
         bg += AudioSegment.silent(duration=total_duration_ms - len(bg))
-    else:
+    elif len(bg) > total_duration_ms:
         bg = bg[:total_duration_ms]
 
     # If using fallback (no Demucs), duck original audio during dubbed segments
@@ -168,6 +179,8 @@ def merge_chunks(
     original_audio = AudioSegment.from_file(original_video)
 
     # 4. Overlay each dubbed segment at its absolute timestamp
+    FADE_MS = 30  # Short crossfade to eliminate hard starts/stops
+
     for seg in segments:
         dubbed_path = seg["dubbed_audio_path"]
         dubbed_clip = AudioSegment.from_file(dubbed_path)
@@ -202,6 +215,12 @@ def merge_chunks(
         if orig_clip.dBFS > -50 and dubbed_clip.dBFS > -50:
             gain_db = orig_clip.dBFS - dubbed_clip.dBFS
             dubbed_clip = dubbed_clip.apply_gain(gain_db)
+
+        # Apply short fade-in/fade-out to eliminate hard pops and clicks
+        # at segment boundaries. 30ms is short enough to be inaudible
+        # as a fade but eliminates the "choppy" hard-cut feel.
+        if len(dubbed_clip) > FADE_MS * 2:
+            dubbed_clip = dubbed_clip.fade_in(FADE_MS).fade_out(FADE_MS)
 
         mixed = mixed.overlay(dubbed_clip, position=position_ms)
 
