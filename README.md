@@ -9,13 +9,24 @@ Built for HackIllinois 2026. Powered by Modal, ElevenLabs, OpenAI, and pyannote.
 ## Architecture
 
 ```
-Video → Extract Audio (ffmpeg)
-     → Diarize Speakers (Modal GPU / pyannote)
-     → Transcribe (Whisper)
-     → Translate (GPT-4o-mini, timing-aware)
+Video → Scene-Aware Chunking (ffmpeg scene detection, ~5-min chunks)
+     → [parallel per chunk on Modal GPU]
+         → Extract Audio (ffmpeg, 16kHz mono)
+         → Diarize Speakers (pyannote, GPU + speaker embeddings)
+         → Transcribe (self-hosted faster-whisper on T4 GPU)
+         → Translate (GPT-4o, context-aware with dialogue batching)
+     → Cross-Chunk Speaker Matching (cosine similarity on embeddings)
+     → Demucs Source Separation (remove vocals, keep music/effects)
      → Clone Voices + Synthesize (ElevenLabs, parallel per speaker)
-     → Composite back onto video (ffmpeg)
+     → Merge + Composite (crossfades, volume matching, h264 encode)
 ```
+
+### 3-Level Modal Container Hierarchy
+- **Level 1 — Coordinator (CPU):** Chunks video, dispatches work, matches speakers, merges final output
+- **Level 2 — process_chunk (T4 GPU) × N:** Per-chunk diarize → transcribe → translate
+- **Level 2 — WhisperTranscriber (T4 GPU):** Self-hosted faster-whisper "medium", parallel via `.map()`
+- **Level 2 — separate_audio (T4 GPU):** Demucs htdemucs source separation
+- **Level 3 — synthesize_speaker (CPU) × N:** Per-speaker voice clone + TTS via ElevenLabs
 
 ---
 
@@ -168,3 +179,6 @@ modal run pipeline/modal_jobs.py
 - [docs/MODAL_NOTES.md](docs/MODAL_NOTES.md) — Modal platform reference
 - [docs/SPENDING_LIMITS.md](docs/SPENDING_LIMITS.md) — API cost guardrails
 - [docs/CONCEPT.md](docs/CONCEPT.md) — Original project concept
+- [docs/FRONTEND.md](docs/FRONTEND.md) — Frontend design philosophy and component inventory
+- [docs/BRAND.md](docs/BRAND.md) — Logo specifications and brand guidelines
+- [docs/BACKGROUND_IDEAS.md](docs/BACKGROUND_IDEAS.md) — Background animation concepts

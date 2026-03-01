@@ -6,7 +6,7 @@
 |---------------|------------------------|-----------------------------------------|----------------------------------|
 | Modal         | $250 (HackIllinois)   | $0.59–$3.95/hr per GPU                  | Set concurrency_limit in code    |
 | ElevenLabs    | Free tier: 10k chars   | ~$0.30 per 1k chars on paid             | Track chars sent per job         |
-| OpenAI        | Per-token billing      | GPT-4o: ~$2.50/1M input, $10/1M output  | Track token count per job        |
+| OpenAI        | Per-token billing      | GPT-4o: ~$2.50/1M input, $10/1M output   | Track token count per job        |
 
 ## Modal Guardrails
 
@@ -24,11 +24,12 @@ Every `@app.function()` MUST include these parameters:
 | Step              | GPU  | Est. time | Est. cost |
 |-------------------|------|-----------|-----------|
 | Diarization       | T4   | ~60s      | ~$0.01    |
-| Transcription     | CPU  | ~10s      | <$0.01    |
+| Transcription     | T4   | ~15s      | ~$0.01    |
+| Demucs separation | T4   | ~30s      | ~$0.01    |
 | Translation       | CPU  | ~5s       | <$0.01    |
 | Voice synthesis   | CPU  | ~30s      | <$0.01    |
-| Composite         | CPU  | ~15s      | <$0.01    |
-| **Total per run** |      |           | **~$0.02–0.05** |
+| Merge + composite | CPU  | ~15s      | <$0.01    |
+| **Total per run** |      |           | **~$0.03–0.06** |
 
 With $250 credits, that's ~5,000+ runs. Plenty for a hackathon. The danger is leaving containers running or forgetting timeouts.
 
@@ -71,22 +72,23 @@ print(f"[ElevenLabs] Total characters synthesized: {total_chars}")
 ## OpenAI Guardrails
 
 ### Rules
-- **Use `gpt-4o-mini` for translation** unless quality is noticeably worse — it's 10x cheaper than `gpt-4o`
-- **Batch segments** — send all segments for one speaker in a single API call instead of one-by-one
+- **Using `gpt-4o` for translation** — upgraded from 4o-mini for better translation quality, especially for context-aware dialogue
+- **Batch segments** — send nearby segments in a single API call with dialogue context instead of one-by-one
 - **Set `max_tokens`** — always cap response length to prevent runaway output
+- **Whisper is self-hosted** — runs on our own T4 GPU containers via faster-whisper, no OpenAI Whisper API cost
 
 ```python
 response = client.chat.completions.create(
-    model="gpt-4o-mini",       # cheaper, try this first
+    model="gpt-4o",            # upgraded for translation quality
     messages=[...],
     max_tokens=2000,           # cap output
 )
 ```
 
 ### Cost per 30-second clip (estimated)
-- Whisper transcription: ~$0.006 per minute of audio → <$0.01
-- GPT-4o-mini translation: ~500 tokens → <$0.01
-- **Total OpenAI per run: <$0.02**
+- Whisper transcription: **$0 (self-hosted on Modal GPU)**
+- GPT-4o translation: ~500 tokens → <$0.01
+- **Total OpenAI per run: <$0.01**
 
 ## Monitoring
 

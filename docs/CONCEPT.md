@@ -10,14 +10,15 @@ The demo is the product. You play 30 seconds of an English movie clip, hit a but
 
 ## What It Does
 
-1. You upload a video (or paste a YouTube link)
-2. A coordinator agent on Modal splits the video into speaker-separated audio segments using diarization
-3. Modal spins up parallel translation + TTS agents — one per speaker — each responsible for translating their lines and cloning their voice using ElevenLabs
-4. A timing reconciler agent adjusts pacing so dubbed speech fits within the original lip-movement windows
-5. A compositor agent merges the dubbed audio tracks back with the original video
-6. **Output:** a fully dubbed video, downloadable, in ~5-10 minutes for a short clip
+1. You upload a video via the web UI
+2. A coordinator on Modal splits the video into scene-aware chunks (~5 min each) and spawns parallel GPU containers
+3. Each chunk runs diarization (pyannote), transcription (self-hosted Whisper on T4 GPU), and context-aware translation (GPT-4o) — all in parallel
+4. Demucs source separation removes original vocals while preserving music/effects/ambient audio
+5. Speaker embeddings are matched across chunks so each actor gets one consistent cloned voice (ElevenLabs)
+6. Dubbed audio is merged with crossfades, per-segment volume matching, and the Demucs background track
+7. **Output:** a fully dubbed video (h264 + AAC), downloadable, in ~5-10 minutes for a short clip
 
-The parallelism is real and necessary — each speaker's voice is cloned and synthesized independently, which is why Modal's ephemeral GPU containers are load-bearing, not decorative.
+The parallelism is real and necessary — chunks process on separate GPU containers, each speaker's voice is cloned independently, and Demucs runs in parallel with everything else. Modal's ephemeral GPU containers are load-bearing, not decorative.
 
 ## What Makes It Technically Impressive
 

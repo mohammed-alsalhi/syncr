@@ -6,7 +6,7 @@
 
 ## Design Philosophy
 
-**"Clean Dark Studio"** — the UI is a minimal, dark-themed control panel focused on clarity and function. No background effects, no visual noise — just content, data, and clean transitions. The vibe: a professional dubbing console that gets out of the way.
+**"Clean Dark Studio"** — the UI is a minimal, dark-themed control panel focused on clarity and function. A subtle sonar ring animation on the landing page provides atmosphere without visual noise. The vibe: a professional dubbing console that gets out of the way.
 
 ### Principles
 1. **Content first** — every element shows data or guides the user. No decorative layers.
@@ -81,6 +81,7 @@ Both loaded as web fonts with system fallbacks (`system-ui, sans-serif` and `ui-
 | Component | Description |
 |-----------|-------------|
 | `BootSequence` | Terminal-style cold boot overlay. Renders on first mount, types `BOOT_LINES` (system status messages) at 130ms/line on a dark card with `rgba(255,255,255,0.03)` background. Phases: `"booting"` (typing with blinking cursor) → `"fading"` (opacity transition out, 0.8s) → `"done"` (unmounts). Total duration ~2.2s. |
+| `SonarRings` | Ambient background animation on the landing page. 5 concentric circles expand outward from center using `sonar-expand` keyframe (8–14s duration, staggered delays). Green stroke at 4–7% opacity. `pointer-events-none`, `z-[1]`, renders behind content. Only shown when no job is active. |
 | `TypewriterText` | Types characters one-by-one at 22ms/char with blinking cursor. Used for the pipeline step label during processing. Resets and re-types when text prop changes. |
 | `WaveformBars` | 36 animated bars with `wave-bar` keyframe + staggered delays. Bars have sinusoidal base heights for visual variety. Active state uses green, inactive uses `rgba(255,255,255,0.06)`. Displayed at the bottom of the pipeline card. |
 
@@ -115,7 +116,7 @@ Both loaded as web fonts with system fallbacks (`system-ui, sans-serif` and `ui-
 Full-screen black overlay → monospace terminal card types system init lines → fades out → unmounts.
 
 ### 2. Landing (no jobId)
-Two-column grid. Left: eyebrow badge ("HackIllinois 2026" with pulse dot), hero title ("Any voice. / Any language."), description paragraph, three stat pills (40+ GPU Containers, ∞ Any Length, 10 Languages). Right: drag-and-drop zone (file upload), 5×2 language grid (10 languages with flag emoji), "Dub this video →" submit button.
+Two-column grid with sonar ring background animation. Left: eyebrow badge ("HackIllinois 2026" with pulse dot), hero title ("Any voice. / Any language."), description paragraph, three stat pills (40+ GPU Containers, ∞ Any Length, 10 Languages). Right: drag-and-drop zone (file upload), 5×2 language grid (10 languages with flag emoji), "Dub this video →" submit button. Header shows Dual Waveform logo (SVG, 32×32) + "Syncr" text.
 
 ### 3. Pipeline (running/queued status)
 Rounded card with: status row (pulse dot + typewriter step label + progress %), full-width progress bar with shimmer, 7-step pipeline node chain with connectors, waveform visualizer. Below: metric pills row + transcript panel.
@@ -139,6 +140,7 @@ Centered card with red styling. Error icon + "Pipeline error" heading + error me
 | `shimmer` | 2s ∞ | Progress bar shine effect (pseudo-element sweeps across) |
 | `spin` | 0.8s ∞ | Upload spinner |
 | `wave-bar` | 380–880ms ∞ | Pipeline waveform bars (alternating, staggered delays) |
+| `sonar-expand` | 8–14s ∞ | Landing page ambient sonar rings (expand + fade) |
 | `pulse-ring` | 1.8s ∞ | Expanding ring on active pipeline nodes |
 | `beam` | 1.2s ∞ | Sweep across active pipeline connectors |
 | `blink-cursor` | 1s ∞ | Typewriter cursor blink (boot sequence + pipeline status) |

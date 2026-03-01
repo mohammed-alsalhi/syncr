@@ -1,5 +1,5 @@
 """
-Step 4: Translate transcribed segments using GPT-4o-mini.
+Step 4: Translate transcribed segments using GPT-4o.
 
 Two modes:
   - translate_segments(): sequential, for local testing

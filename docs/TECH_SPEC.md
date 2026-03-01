@@ -32,7 +32,7 @@ Syncr is a movie-scale AI dubbing pipeline. Upload a video of any length — fro
                                                                      └──────────────────────────────────────┘
 ```
 
-**Data flow:** Video file → FastAPI saves to disk → orchestrator calls `coordinator.remote()` in a background thread → coordinator chunks the video at scene boundaries → spawns `process_chunk` GPU containers in parallel (one per chunk) → each chunk runs extract → diarize → transcribe (self-hosted Whisper via `.map()`) → context-aware translate → coordinator matches speakers across chunks via embedding cosine similarity → spawns `synthesize_speaker` CPU containers (one per global speaker) → quality verification loop (re-translate + re-synthesize failed segments, max 2 retries) → merge all chunks into final video → return bytes → FastAPI saves to disk and serves download.
+**Data flow:** Video file → FastAPI saves to disk → orchestrator calls `coordinator.remote()` in a background thread → coordinator extracts 44.1kHz audio for Demucs and spawns `separate_audio` in parallel → chunks the video at scene boundaries → spawns `process_chunk` GPU containers in parallel (one per chunk) → each chunk runs extract → diarize → transcribe (self-hosted Whisper via `.map()`) → context-aware translate → coordinator matches speakers across chunks via embedding cosine similarity → spawns `synthesize_speaker` CPU containers (one per global speaker) → center-trims Demucs accompaniment → merges all chunks with crossfades, volume matching, and background audio into final video (h264 + AAC) → return bytes → FastAPI saves to disk and serves download.
 
 **Container topology** (10-minute video, 2 chunks, 3 speakers, 20 segments):
 
@@ -41,8 +41,9 @@ Syncr is a movie-scale AI dubbing pipeline. Upload a video of any length — fro
 | coordinator | 1 | CPU | Chunk + dispatch + merge |
 | process_chunk | 2 | T4 GPU | Per-chunk pipeline |
 | WhisperTranscriber | up to 4 | T4 GPU | Parallel segment transcription |
+| separate_audio | 1 | T4 GPU | Demucs source separation |
 | synthesize_speaker | 3 | CPU | Per-speaker voice synthesis |
-| **Total** | **~10** | **3–5 GPU + 4–5 CPU** | |
+| **Total** | **~11** | **4–6 GPU + 4–5 CPU** | |
 
 For a full movie (20 chunks, 5 speakers, 200 segments): **40–60+ containers**.
 
@@ -291,7 +292,7 @@ Two modes:
 
 ```python
 def translate_segments_with_context(segments, target_language) -> list[dict]:
-    """GPT-4o-mini with dialogue context. Format: [SPEAKER, duration]: text"""
+    """GPT-4o with dialogue context. Format: [SPEAKER, duration]: text"""
 ```
 
 **Why context-aware:** Single-segment translation misses conversational flow. Batching nearby segments lets GPT understand who's responding to whom, producing dramatically better translations for dialogue.
@@ -326,18 +327,37 @@ def build_strict_retranslation_prompt(segment, target_language) -> str:
 - **Silence:** dBFS < -35 → `mostly_silence`
 - **Minimum length:** < 0.3 seconds → `too_short`
 
-**Retry loop** (in coordinator): Failed segments → re-translate with stricter duration constraint → re-synthesize → verify again. Max 2 rounds, then accept with speedup (graceful degradation).
+**Note:** The quality retry loop was removed in Sprint 9 because it created new voice clones per retry, causing voice inconsistency. Timing issues are now handled by `merge.py` using atempo speedup. The verification functions remain available but are not called in the main pipeline flow.
 
-### 5.8 Chunk Merging (`merge.py`)
+### 5.8 Demucs Source Separation (`separate_audio` in `modal_jobs.py`)
 
 ```python
-def merge_chunks(original_video, chunk_results, job_id, output_dir) -> str:
-    """Merge dubbed audio from all chunks onto original video."""
+@app.function(image=gpu_image, gpu="T4", timeout=600, secrets=[...])
+def separate_audio(audio_bytes: bytes) -> bytes:
+    """Run Demucs htdemucs to remove vocals, return accompaniment (music/effects/ambient)."""
 ```
 
-**Steps:** Filter overlap duplicates → build full-length silent AudioSegment → overlay each dubbed segment at absolute timestamp → apply atempo speedup if needed → mux with original video (video stream copied, audio replaced).
+**Purpose:** Removes original vocal track from the video's audio, preserving music, sound effects, and ambient sounds. The accompaniment is used as the background track under the dubbed voices.
 
-### 5.9 Video Composition (`composite.py`)
+**Implementation:** Uses `python -m demucs --two-stems=vocals` CLI subprocess (not `demucs.api`, which only exists on GitHub main, not PyPI 4.0.1). Runs on T4 GPU in parallel with chunk processing.
+
+### 5.9 Chunk Merging (`merge.py`)
+
+```python
+def merge_chunks(original_video, chunk_results, job_id, output_dir, bg_audio_bytes=None) -> str:
+    """Merge dubbed audio from all chunks onto original video with background audio."""
+```
+
+**Steps:**
+1. Filter overlap duplicates at chunk boundaries
+2. Center-trim Demucs accompaniment (remove symmetric padding from both start and end)
+3. Build full-length AudioSegment from Demucs background (or silence if unavailable)
+4. Overlay each dubbed segment at absolute timestamp with 30ms fade-in/fade-out crossfades
+5. Match each dubbed segment's volume (dBFS) to the original audio at that timestamp
+6. Apply atempo speedup for segments that exceed their time slot
+7. Encode final video with `libx264 -preset fast -crf 22` + AAC audio + `-movflags +faststart`
+
+### 5.10 Video Composition (`composite.py`)
 
 Provides `_build_atempo_chain()` for speedup and `composite_video()` for single-chunk compositing. Used by `merge.py` for the atempo chain.
 
@@ -349,14 +369,14 @@ Provides `_build_atempo_chain()` for speedup and `composite_video()` for single-
 
 **Level 1 — `coordinator` (CPU, timeout=900s):**
 1. Save input video to temp dir
-2. Call `detect_scenes()` + `split_video()` (fast, just ffmpeg)
-3. Spawn `process_chunk.spawn()` per chunk (parallel GPU containers)
-4. Collect results as they complete, update progress
-5. Match speakers across chunks via embedding cosine similarity
-6. Spawn `synthesize_speaker.spawn()` per global speaker (parallel CPU containers)
-7. Collect synthesis results
-8. Run quality verification + retry loop
-9. Call `merge_chunks()` for final video
+2. Extract 44.1kHz audio for Demucs, spawn `separate_audio.spawn()` in parallel
+3. Call `detect_scenes()` + `split_video()` (fast, just ffmpeg)
+4. Spawn `process_chunk.spawn()` per chunk (parallel GPU containers)
+5. Collect results as they complete, update progress
+6. Match speakers across chunks via embedding cosine similarity
+7. Spawn `synthesize_speaker.spawn()` per global speaker (parallel CPU containers)
+8. Collect synthesis results
+9. Center-trim Demucs accompaniment, call `merge_chunks()` for final video (crossfades, volume matching, h264)
 10. Return final video as bytes
 
 **Level 2 — `process_chunk` (GPU T4, timeout=600s):**
@@ -370,6 +390,11 @@ Provides `_build_atempo_chain()` for speedup and `composite_video()` for single-
 - Model loaded once via `@modal.enter()`, reused across calls
 - Called via `.map()` for parallel segment transcription
 - `concurrency_limit=4` — up to 4 transcriber containers
+
+**Level 2 — `separate_audio` (GPU T4):**
+- Runs Demucs htdemucs via CLI subprocess (`python -m demucs --two-stems=vocals`)
+- Spawned in parallel with chunk processing (doesn't wait for chunks)
+- Returns accompaniment audio bytes (music + effects + ambient, no vocals)
 
 **Level 3 — `synthesize_speaker` (CPU, concurrency_limit=6):**
 - One container per speaker
@@ -464,39 +489,49 @@ Custom keyframes registered as Tailwind utilities:
 syncr/
 ├── CLAUDE.md                    # Source of truth for Claude sessions
 ├── README.md
+├── TODO.md                      # Setup, spike tests, demo prep checklist
+├── setup.sh                     # Project setup script
 ├── backend/
 │   ├── .env                     # API keys (git-ignored)
 │   ├── .env.example
 │   ├── requirements.txt
 │   ├── main.py                  # FastAPI server (3 endpoints)
 │   ├── models.py                # Pydantic models (JobStatus with chunk tracking)
+│   ├── spike1_diarize.py        # Spike test: diarization quality
+│   ├── spike2_voice.py          # Spike test: ElevenLabs voice cloning
+│   ├── spike3_e2e.py            # Spike test: end-to-end pipeline
 │   └── pipeline/
+│       ├── __init__.py
 │       ├── modal_app.py         # Modal App + 3 image definitions
-│       ├── modal_jobs.py        # 3-level container hierarchy
+│       ├── modal_jobs.py        # 3-level container hierarchy + Demucs separation
 │       ├── orchestrator.py      # Local orchestrator (real progress via modal.Dict)
 │       ├── chunk.py             # Scene-aware video chunking
 │       ├── extract.py           # ffmpeg audio extraction
 │       ├── diarize.py           # pyannote diarization + speaker embeddings
-│       ├── transcribe.py        # Whisper API fallback (not used in pipeline)
-│       ├── translate.py         # GPT-4o-mini translation (sequential + context-aware)
-│       ├── synthesize.py        # ElevenLabs local helper (not used in pipeline)
+│       ├── transcribe.py        # Whisper fallback (pipeline uses self-hosted WhisperTranscriber)
+│       ├── translate.py         # GPT-4o context-aware translation (sequential + batched)
+│       ├── synthesize.py        # ElevenLabs local helper (pipeline uses synthesize_speaker)
 │       ├── composite.py         # ffmpeg composition + atempo helper
-│       ├── merge.py             # Multi-chunk merge onto original video
-│       └── quality.py           # Segment verification + retry prompts
+│       ├── merge.py             # Multi-chunk merge + Demucs bg + crossfades + volume matching
+│       └── quality.py           # Segment verification (retry loop removed)
 ├── frontend/
 │   ├── index.html
 │   ├── package.json
 │   ├── vite.config.js
 │   ├── tailwind.config.js       # Custom animation utilities
+│   ├── postcss.config.js        # Autoprefixer
 │   └── src/
 │       ├── main.jsx
-│       ├── index.css            # Keyframe animations + range input styling
-│       └── App.jsx              # Pipeline dashboard + synced player
+│       ├── index.css            # Keyframe animations (sonar, wave-bar, shimmer, etc.)
+│       └── App.jsx              # Pipeline dashboard + synced player + sonar bg
 ├── docs/
-│   ├── CONCEPT.md
+│   ├── CONCEPT.md               # Original project concept
 │   ├── TECH_SPEC.md             # This file
-│   ├── MODAL_NOTES.md
-│   └── SPENDING_LIMITS.md
+│   ├── MODAL_NOTES.md           # Modal platform reference
+│   ├── SPENDING_LIMITS.md       # API cost guardrails
+│   ├── FRONTEND.md              # Frontend design philosophy + component inventory
+│   ├── BRAND.md                 # Logo specifications + brand guidelines
+│   └── BACKGROUND_IDEAS.md      # Background animation concepts
 └── tmp/                         # git-ignored, runtime files
     ├── uploads/
     └── outputs/
@@ -552,10 +587,12 @@ The orchestrator wraps the entire pipeline in try/except and updates job status 
 
 4. **Global speaker matching over per-chunk synthesis:** Without matching, the same actor would get a different cloned voice in each chunk. Embedding cosine similarity (threshold > 0.85) identifies the same speaker across chunks.
 
-5. **Quality feedback loop over accept-all:** Synthesized audio can be too long, mostly silent, or overlap with the next segment. Verification + re-translation with stricter constraints + re-synthesis catches these issues before the final merge.
+5. **Single clone per speaker over retry loop:** The quality retry loop was removed because each retry created a new voice clone, causing voice inconsistency across segments. Timing issues are handled by merge.py atempo speedup, and 30ms crossfades eliminate hard pops at segment boundaries.
 
-6. **Sync function orchestrator over async:** `coordinator.remote()` is a blocking Modal call. Running it inside an `async def` would freeze FastAPI's event loop. Using a sync `def` lets FastAPI run it in a threadpool automatically.
+6. **Demucs source separation over silence/original audio:** Building from silence loses ambient atmosphere. Keeping original audio has vocal bleed. Demucs separates vocals from accompaniment, preserving music/effects/ambient as the background track under dubbed voices.
 
-7. **Lazy `modal.Dict` initialization over module-level:** Creating the Dict reference at import time crashes if Modal isn't authenticated. Lazy init defers it to first use (inside a Modal container where auth is guaranteed).
+7. **Sync function orchestrator over async:** `coordinator.remote()` is a blocking Modal call. Running it inside an `async def` would freeze FastAPI's event loop. Using a sync `def` lets FastAPI run it in a threadpool automatically.
 
-8. **Bytes over paths for cross-container data:** Modal containers have separate filesystems. Voice samples and dubbed audio must be passed as bytes, not file paths.
+8. **Lazy `modal.Dict` initialization over module-level:** Creating the Dict reference at import time crashes if Modal isn't authenticated. Lazy init defers it to first use (inside a Modal container where auth is guaranteed).
+
+9. **Bytes over paths for cross-container data:** Modal containers have separate filesystems. Voice samples and dubbed audio must be passed as bytes, not file paths.

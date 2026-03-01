@@ -4,16 +4,16 @@
 
 ---
 
-## Current Placeholder (to be replaced)
+## Active Logo — Dual Waveform (Concept D)
 
 ```jsx
-<div
-  className="w-6 h-6 rounded flex items-center justify-center text-[10px] font-black font-mono"
-  style={{ background: "#62DE61", color: "#000" }}
->S</div>
+<svg viewBox="0 0 24 24" className="w-8 h-8 flex-shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M4 12L7 9L11 15L14 9L17 12" stroke="#62DE61" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  <path d="M7 15L10 18L14 12L17 18L20 15" stroke="#62DE61" strokeWidth="2" strokeOpacity="0.5" strokeLinecap="round" strokeLinejoin="round"/>
+</svg>
 ```
 
-A 24×24px rounded green square with a black "S" in JetBrains Mono Black. This is the element the new logo will replace.
+Two overlapping zigzag waveforms — top at full opacity, bottom at 50%. Represents original audio and its dubbed echo, synced but shifted. Rendered as a 32×32px inline SVG in the header.
 
 ---
 
@@ -22,11 +22,11 @@ A 24×24px rounded green square with a black "S" in JetBrains Mono Black. This i
 ### Size & Space
 | Property | Value | Notes |
 |----------|-------|-------|
-| Container | 24×24px (`w-6 h-6`) | Current slot in the header |
-| Max recommended | 28×28px | Can bump up slightly if needed |
-| Header height | 56px | Logo must sit comfortably within this |
-| Spacing | 12px gap to "Syncr" text | Set by `gap-3` in the flex container |
-| Alignment | Vertically centered (`self-center`) | Independent of text baseline alignment |
+| Container | 32×32px (`w-8 h-8`) | Current slot in the header |
+| ViewBox | `0 0 24 24` | SVG coordinates |
+| Header height | 56px | Logo sits comfortably within this |
+| Spacing | 14px gap to "Syncr" text | Set by `gap-3.5` in the flex container |
+| Alignment | flex-shrink-0 | Prevents compression in flex layout |
 
 ### Required Formats
 | Format | Purpose |
@@ -133,8 +133,8 @@ A continuous zigzag stroke forming a geometric S-shape with sharp miter joins an
 </svg>
 ```
 
-### D. Dual Waveform (current)
-Two zigzag waveforms offset and overlapping — the top one full opacity, the bottom one at 50%. Represents original audio and its dubbed echo, synced but shifted.
+### D. Dual Waveform (ACTIVE — in production)
+Two zigzag waveforms offset and overlapping — the top one full opacity, the bottom one at 50%. Represents original audio and its dubbed echo, synced but shifted. **This is the logo currently used in the header.**
 
 ```svg
 <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -147,15 +147,12 @@ Two zigzag waveforms offset and overlapping — the top one full opacity, the bo
 
 ## Implementation
 
-Once the logo SVG is ready, it replaces the placeholder in `App.jsx` (line 414–417):
+The Dual Waveform logo is implemented as an inline SVG in `App.jsx` (header section):
 
 ```jsx
-{/* Before (placeholder) */}
-<div className="w-6 h-6 rounded ..." style={{ background: "#62DE61", color: "#000" }}>S</div>
-
-{/* After (inline SVG) */}
-<svg viewBox="0 0 24 24" className="w-6 h-6 flex-shrink-0 self-center" fill="none">
-  {/* logo paths here */}
+<svg viewBox="0 0 24 24" className="w-8 h-8 flex-shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M4 12L7 9L11 15L14 9L17 12" stroke={GREEN} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  <path d="M7 15L10 18L14 12L17 18L20 15" stroke={GREEN} strokeWidth="2" strokeOpacity="0.5" strokeLinecap="round" strokeLinejoin="round"/>
 </svg>
 ```
 
@@ -179,6 +176,7 @@ Primary Green:   #62DE61
 Background:      #000000
 Body Font:       Space Grotesk
 Mono Font:       JetBrains Mono
-Logo Size:       24×24px (header), scalable SVG
+Logo:            Dual Waveform (Concept D)
+Logo Size:       32×32px (header), scalable SVG
 Logo Style:      Geometric, minimal, tool-like
 ```

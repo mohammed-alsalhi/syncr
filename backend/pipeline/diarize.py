@@ -36,7 +36,6 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
     from pydub import AudioSegment
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,7 +83,6 @@ def diarize_speakers(audio_path: str, work_dir: str = "/tmp") -> list[dict]:
         embedding_model = Inference(
             "pyannote/wespeaker-voxceleb-resnet34-LM",
             window="whole",
-            use_auth_token=hf_token,
         )
         embedding_model.to(device)
 
