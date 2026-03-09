@@ -392,14 +392,15 @@ function SyncedPlayer({ originalUrl, dubbedUrl, language }) {
 
 /* ── Main App ── */
 export default function App() {
-  const [file,        setFile]        = useState(null)
-  const [language,    setLanguage]    = useState("es")
-  const [jobId,       setJobId]       = useState(null)
-  const [status,      setStatus]      = useState(null)
-  const [originalUrl, setOriginalUrl] = useState(null)
-  const [dubbedUrl,   setDubbedUrl]   = useState(null)
-  const [isDragging,  setIsDragging]  = useState(false)
-  const [isUploading, setIsUploading] = useState(false)
+  const [file,           setFile]           = useState(null)
+  const [language,       setLanguage]       = useState("es")
+  const [jobId,          setJobId]          = useState(null)
+  const [status,         setStatus]         = useState(null)
+  const [originalUrl,    setOriginalUrl]    = useState(null)
+  const [dubbedUrl,      setDubbedUrl]      = useState(null)
+  const [isDragging,     setIsDragging]     = useState(false)
+  const [isUploading,    setIsUploading]    = useState(false)
+  const [elevenLabsKey,  setElevenLabsKey]  = useState("")
   const pollRef = useRef(null)
   const fileRef = useRef(null)
 
@@ -411,11 +412,12 @@ export default function App() {
   }
 
   const startJob = async () => {
-    if (!file) return
+    if (!file || !elevenLabsKey.trim()) return
     setIsUploading(true)
     const form = new FormData()
     form.append("file", file)
     form.append("target_language", language)
+    form.append("elevenlabs_api_key", elevenLabsKey.trim())
     const res  = await fetch(`${API_BASE}/dub`, { method: "POST", body: form })
     const data = await res.json()
     setIsUploading(false)
@@ -439,7 +441,7 @@ export default function App() {
   const isDone    = status?.status === "done"
   const isError   = status?.status === "error"
 
-  const reset = () => { setJobId(null); setStatus(null); setFile(null); setOriginalUrl(null); setDubbedUrl(null) }
+  const reset = () => { setJobId(null); setStatus(null); setFile(null); setOriginalUrl(null); setDubbedUrl(null); setElevenLabsKey("") }
 
   return (
     <div className="min-h-screen bg-black text-white font-sans">
@@ -568,10 +570,30 @@ export default function App() {
                 ))}
               </div>
 
+              {/* ElevenLabs API Key */}
+              <div
+                className="flex items-center gap-2 px-3 py-2.5 rounded-xl"
+                style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.08)" }}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.25)" strokeWidth={1.5} className="w-4 h-4 flex-shrink-0">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
+                </svg>
+                <input
+                  type="password"
+                  placeholder="ElevenLabs API key"
+                  value={elevenLabsKey}
+                  onChange={(e) => setElevenLabsKey(e.target.value)}
+                  className="flex-1 bg-transparent text-sm text-white/70 placeholder-white/20 outline-none font-mono"
+                />
+                {elevenLabsKey && (
+                  <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: GREEN }} />
+                )}
+              </div>
+
               {/* Submit */}
               <button
                 onClick={startJob}
-                disabled={!file || isUploading}
+                disabled={!file || !elevenLabsKey.trim() || isUploading}
                 className="w-full py-3 rounded-xl font-semibold text-sm tracking-wide transition-all duration-150 disabled:opacity-20 disabled:cursor-not-allowed hover:opacity-90 active:scale-[0.99]"
                 style={{ background: GREEN, color: "#000" }}
               >

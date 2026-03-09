@@ -296,6 +296,7 @@ def synthesize_speaker(
     segments: list[dict],
     sample_bytes: bytes,
     job_id: str,
+    elevenlabs_api_key: str,
 ) -> list[dict]:
     """
     Clone one speaker's voice and synthesize all their segments.
@@ -309,7 +310,7 @@ def synthesize_speaker(
     import aiohttp
 
     ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
-    api_key = os.environ["ELEVENLABS_API_KEY"]
+    api_key = elevenlabs_api_key
 
     async def _run():
         async with aiohttp.ClientSession() as session:
@@ -651,7 +652,7 @@ def separate_audio(audio_bytes: bytes) -> bytes:
     secrets=[modal.Secret.from_name("mimic-secrets")],
     volumes={"/data": volume},
 )
-def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
+def coordinator(video_bytes: bytes, target_language: str, job_id: str, elevenlabs_api_key: str) -> bytes:
     """
     Top-level coordinator. Chunks video, dispatches parallel processing,
     matches speakers across chunks, runs synthesis, merges final output.
@@ -798,7 +799,7 @@ def coordinator(video_bytes: bytes, target_language: str, job_id: str) -> bytes:
                 {k: v for k, v in s.items() if k != "audio_bytes"}
                 for s in segs
             ]
-            handle = synthesize_speaker.spawn(spk, clean_segs, speaker_samples[spk], job_id)
+            handle = synthesize_speaker.spawn(spk, clean_segs, speaker_samples[spk], job_id, elevenlabs_api_key)
             synth_handles.append(handle)
 
         # Collect synthesis results

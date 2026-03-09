@@ -36,6 +36,7 @@ async def create_dub_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     target_language: str = Form("es"),
+    elevenlabs_api_key: str = Form(...),
 ):
     job_id = str(uuid.uuid4())
     input_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
@@ -58,6 +59,7 @@ async def create_dub_job(
         job_id=job_id,
         input_path=str(input_path),
         target_language=target_language,
+        elevenlabs_api_key=elevenlabs_api_key,
         jobs=jobs,
         output_dir=str(OUTPUT_DIR),
     )

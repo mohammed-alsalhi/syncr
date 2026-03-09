@@ -63,6 +63,7 @@ def run_pipeline(
     job_id: str,
     input_path: str,
     target_language: str,
+    elevenlabs_api_key: str,
     jobs: dict,
     output_dir: str,
 ):
@@ -86,7 +87,7 @@ def run_pipeline(
         # Call the deployed Modal coordinator function
         import modal
         coordinator_fn = modal.Function.from_name("syncr", "coordinator")
-        output_bytes = coordinator_fn.remote(video_bytes, target_language, job_id)
+        output_bytes = coordinator_fn.remote(video_bytes, target_language, job_id, elevenlabs_api_key)
 
         # Stop progress polling
         stop_event.set()
